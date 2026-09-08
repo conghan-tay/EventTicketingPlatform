@@ -3,6 +3,7 @@
 package e2e
 
 import (
+	"fmt"
 	"net/http"
 	"net/url"
 	"testing"
@@ -90,6 +91,12 @@ func (h *Harness) TableCounts() map[string]int64 {
 	}
 	require.NoError(h.t, resp.DecodeInto(&out))
 	return out.Tables
+}
+
+// pathf builds a request path. Kept separate so path construction is consistent and
+// obviously distinct from query-string building.
+func pathf(format string, args ...any) string {
+	return fmt.Sprintf(format, args...)
 }
 
 // Query builds a query string, keeping search tests readable.
