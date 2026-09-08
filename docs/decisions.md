@@ -329,6 +329,56 @@ Accepted, and revisited if a service ever needs independent scaling of its store
 
 ---
 
+## D16 — Search results ordered by start time, not relevance
+
+**Context / requirement:** Search needs stable keyset pagination (H7: every result exactly once, no
+duplicates, no gaps) and ideally relevance ranking. Decided during implementation.
+
+**Chosen approach:** Order by `(starts_at, event_id)` ascending — soonest first. The `tsvector` already
+carries `setweight` title/description weights, but they are not used for ordering yet.
+
+**Why it fits:** Relevance ranking and stable keyset pagination pull in opposite directions. A relevance
+score is neither stable across concurrent writes nor usable as an indexed sort key, so paging by it either
+repeats or skips rows — exactly the failure H7 exists to catch. Start time is stable, indexed
+(`events_onsale_keyset_idx`), and genuinely useful for a ticketing product, where "what's on soon" is the
+common intent.
+
+**Alternatives considered:** `ts_rank` ordering with offset pagination — would give better text relevance
+but reintroduces the deep-offset scan that keyset pagination exists to avoid. Ranking with a
+rank-and-id cursor — the rank is not stable across writes, so the cursor silently drifts.
+
+**Tradeoffs and consequences:** A search for a broad term returns the soonest matching events rather than
+the best matching ones. Accepted for now; it is the right moment to fix this when OpenSearch lands (D6),
+since the engine handles ranked pagination properly. The stored weights mean no backfill will be needed.
+
+**Status:** accepted
+
+---
+
+## D17 — Pagination cursors are opaque but unsigned
+
+**Context / requirement:** The plan called for a "tamper-evident" cursor. Reconsidered during implementation.
+
+**Chosen approach:** Cursors are base64url-encoded JSON of `(starts_at, event_id)`, strictly validated on
+decode, with no HMAC. A malformed cursor is a 400.
+
+**Why it fits:** Signing protects against tampering that gains something. Here a forged cursor can only
+change which page of *public* search results the caller sees — no authorization decision depends on its
+contents and it exposes no private data. An HMAC would add key management and rotation for no security
+benefit. What actually matters is that a bad cursor is rejected loudly rather than silently restarting from
+page one, which would repeat results; that is enforced and unit-tested.
+
+**Alternatives considered:** HMAC-signed cursors — appropriate the moment a cursor ever encodes a
+user-scoped or permission-scoped filter. **Revisit trigger:** the first cursor over non-public data, e.g.
+`GET /v1/bookings` in Step 5.
+
+**Tradeoffs and consequences:** A caller can hand-craft a cursor and jump to an arbitrary position in public
+search results. Harmless, and equivalent to what they could achieve with date filters anyway.
+
+**Status:** accepted
+
+---
+
 ## D13 — Build scope limited to Steps 0–3
 
 **Context / requirement:** The user scoped the initial build to catalog and search, stopping before the

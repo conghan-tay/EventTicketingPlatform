@@ -126,6 +126,11 @@ GET  /v1/events/:id/seats?section=         → seat-level map (advisory only, NO
 GET  /v1/search?q=&from=&to=&lat=&lng=&radius_km=&category=&cursor=&limit=
 ```
 
+Search results are ordered by event start time, soonest first — not by relevance (D16). Free text matches a
+stemmed `tsvector` or a trigram substring on the title, and `websearch_to_tsquery` is used so hostile input
+cannot raise a syntax error. `lat`, `lng` and `radius_km` must be supplied together; a venue with no
+coordinates is excluded from radius results because its location is unknown.
+
 ### Booking — `auth`, strongly consistent, never cached
 
 ```
@@ -145,8 +150,8 @@ GET    /v1/bookings             → my bookings (cursor paginated)
 ### Organizer — `auth`
 
 ```
-POST /v1/venues                     POST /v1/venues/:id/seats:bulk
-POST /v1/events                     POST /v1/events/:id/publish   → materializes tickets
+POST /v1/venues                     POST /v1/venues/:venueID/seats
+POST /v1/events                     POST /v1/events/:eventID/publish   → materializes tickets
 ```
 
 ### Internal — `private` (cron in cloud; invoked directly by tests locally)

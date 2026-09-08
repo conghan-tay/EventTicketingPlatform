@@ -18,12 +18,15 @@ The E2E suite is the project's live progress dashboard.
 
 | Fixture | Purpose |
 |---|---|
-| `ResetAll` | Truncates all tables between tests, via `testsupport` |
-| `SeedVenue(sections, rowsPerSection, seatsPerRow)` | Creates a venue with a deterministic seat map |
-| `SeedEvent(venue, opts)` | Creates an event; `opts` controls title, category, dates, geo, tiers |
+| `NewHarness(t)` / `Reset()` | Empties all tables and releases the clock, via `testsupport` |
+| `CreateVenue(VenueOpts)` | Creates a venue plus its seat map; zero fields get defaults |
+| `AddSeats(venueID, sections)` | Materializes seat topology from section specs |
+| `CreateEvent(venueID, EventOpts)` | Creates a DRAFT event; `opts` controls title, category, dates, tiers |
 | `PublishEvent(id)` | Publishes, materializing tickets |
-| `SetClock(t)` / `AdvanceClock(d)` | Deterministic time control (D11) |
-| `AsUser(uid)` | Returns a client carrying that user's bearer token |
+| `SeedPublishedEvent(v, e)` | Composes the three above — the common setup |
+| `SetClock(t)` / `AdvanceClock(d)` / `ClockNow()` | Deterministic time control (D11) |
+| `TableCounts()` | Per-table row counts, for asserting inventory was materialized |
+| `AsUser(uid)` / `Anonymous()` | Clients with and without credentials |
 
 ### Client
 
@@ -99,12 +102,17 @@ migrations), `testcontainers-go` (`encore test` provisions test databases), `go-
 - **Cron jobs do not run locally or in preview environments** → the reaper must be an invokable endpoint (D10).
 - Cron endpoints must be `func(ctx) error` or `func(ctx) (*T, error)` and idempotent.
 - A service needing dependency injection uses a service struct with `//encore:service` + `initService`.
+- **Query strings do not support pointer types** (`*time.Time` is rejected outright). Optional filters must
+  therefore arrive as strings and be parsed in application code — which is why `search.Params` is all
+  strings and `parse()` owns the validation.
+- The per-service database role has CRUD privileges but **not table ownership**, so `TRUNCATE` is denied.
+  Test cleanup uses ordered `DELETE` instead (see `store.TruncateAll`).
 
 ---
 
 ## 3. Build plan
 
-### Step 0 — Scaffold and dev environment — ☐
+### Step 0 — Scaffold and dev environment — ✅ done
 
 **What to build**
 - Encore app (`encore.app`), `go.mod`, service directory layout.
@@ -119,7 +127,7 @@ migrations), `testcontainers-go` (`encore test` provisions test databases), `go-
 
 ---
 
-### Step 1 — E2E harness + testsupport service — ☐
+### Step 1 — E2E harness + testsupport service — ✅ done
 
 **What to build**
 - `e2e/client.go`, `e2e/fixtures.go`, `e2e/main_test.go` (base URL, health wait, reset between tests).
@@ -135,13 +143,13 @@ migrations), `testcontainers-go` (`encore test` provisions test databases), `go-
 
 ---
 
-### Step 2 — Catalog vertical slice — ☐
+### Step 2 — Catalog vertical slice — ✅ done
 
 **What to build**
 - Migrations: `venues`, `seats`, `events`, `price_tiers`, `tickets`, `holds` (tables created now so the Step 4–5
   booking path needs no migration rewrite), plus indexes from the design.
-- `organizer` service: `POST /v1/venues`, `POST /v1/venues/:id/seats:bulk`, `POST /v1/events`,
-  `POST /v1/events/:id/publish` (materializes one ticket per seat).
+- `organizer` service: `POST /v1/venues`, `POST /v1/venues/:venueID/seats`, `POST /v1/events`,
+  `POST /v1/events/:eventID/publish` (materializes one ticket per seat).
 - `catalog` service: `GET /v1/events/:id`, `GET /v1/events/:id/availability`, `GET /v1/events/:id/seats`.
 
 **Definition of done**
@@ -152,13 +160,13 @@ migrations), `testcontainers-go` (`encore test` provisions test databases), `go-
 
 ---
 
-### Step 3 — Search — ☐
+### Step 3 — Search — ✅ done
 
 **What to build**
 - Migration: `search_vector` generated column + GIN index; geo columns + index; `(starts_at, event_id)` index.
 - `search` service: `GET /v1/search` with free text, date range, location radius, category, keyset pagination.
 - `SearchIndex` interface with a Postgres implementation (D6 seam).
-- Opaque, tamper-evident cursor encoding.
+- Opaque, strictly-validated cursor encoding (deliberately unsigned — see D17).
 
 **Definition of done**
 - H5, H6, H7 green; S6, S7, S8 green.
