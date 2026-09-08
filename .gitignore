@@ -1,0 +1,12 @@
+/.encore
+encore.gen.go
+encore.gen.cue
+*.log
+
+.DS_Store
+.idea/
+.vscode/
+
+/bin/
+/tmp/
+/encore.gen
