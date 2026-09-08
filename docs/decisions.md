@@ -280,6 +280,55 @@ proven. Omitting it entirely — knowingly leaves the worst failure mode unaddre
 
 ---
 
+## D14 — Development-grade auth handler, hard-failed outside local/test
+
+**Context / requirement:** `auth` endpoints need a caller identity, but building real identity management
+is out of scope and would not exercise anything the design cares about.
+
+**Chosen approach:** An Encore auth handler that treats the bearer token as the user id after validating it
+against `^[A-Za-z0-9_-]{3,64}$`. It **returns `Unimplemented` in any environment that is not a unit test or a
+locally-running app**, so it cannot be deployed accidentally.
+
+**Why it fits:** It establishes the property the rest of the system depends on — identity always arrives via
+the verified auth context and is never read from a request body — without building an identity provider. The
+environment guard is unit-tested across the full matrix and **fails closed** on unknown environment types.
+
+**Alternatives considered:** Real JWT verification — more work for no design insight at this stage.
+No auth at all — would have let a user id leak into request bodies and normalised an unsafe pattern.
+
+**Tradeoffs and consequences:** Not usable in any real deployment; must be replaced before one. The format
+validation also keeps odd characters out of logs and cache keys.
+
+**Note on environment detection:** `encore.EnvLocal` is deprecated and no longer returned by the runtime. A
+locally-running app reports `EnvDevelopment` + `CloudLocal`. Guarding on `EnvLocal` would have rejected local
+development entirely — this is unit-tested in `internal/clock/clock_test.go` and `identity/auth_test.go`.
+
+**Status:** accepted
+
+---
+
+## D15 — Single shared database, not one per service
+
+**Context / requirement:** Publishing an event must atomically mark it `ON_SALE` and materialise one ticket
+per seat. Encore encourages a database per service.
+
+**Chosen approach:** One `ticketing` database owned by a `store` package, accessed by other services via
+`sqldb.Named("ticketing")`. Table ownership by service is enforced by convention and code review.
+
+**Why it fits:** Events and tickets must be transactable together, which a database-per-service split makes
+impossible without a distributed transaction — a large cost for no benefit at this scale. It also matches the
+design's actual deployment target: a single Postgres leader with read replicas.
+
+**Alternatives considered:** A database per service — more idiomatic for Encore, but would force publish to
+become a saga purely as an artifact of the storage split.
+
+**Tradeoffs and consequences:** Service isolation at the storage layer is conventional rather than enforced.
+Accepted, and revisited if a service ever needs independent scaling of its store.
+
+**Status:** accepted
+
+---
+
 ## D13 — Build scope limited to Steps 0–3
 
 **Context / requirement:** The user scoped the initial build to catalog and search, stopping before the
