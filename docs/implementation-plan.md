@@ -3,7 +3,7 @@
 Derived from `system-design.md` and `decisions.md`. Progress is marked as steps complete.
 Last updated: 2026-09-08
 
-**Current build scope: Steps 0–6** (see D13). Steps 7–8 are specified but not built.
+**Build complete: Steps 0–8.**
 
 ---
 
@@ -214,7 +214,7 @@ second user. Unit test: reaping a SOLD ticket whose old hold expired leaves it S
 
 ---
 
-### Step 7 — Read-path hardening — ☐ *not in current scope*
+### Step 7 — Read-path hardening — ✅ done
 
 **What to build:** `event_view` read model, in-transaction `events.version` bump, Encore versioned cache
 keyspace, 5s-TTL availability summary, ETag + `Cache-Control`, single-flight coalescing, cache-outage
@@ -225,7 +225,7 @@ and the next read reflects it with no explicit purge; `If-None-Match` returns 30
 
 ---
 
-### Step 8 — Load proof and observability — ☐ *not in current scope*
+### Step 8 — Load proof and observability — ✅ done
 
 **What to build:** a concurrency harness driving a simulated onsale (N workers, one event, all seats), plus
 counters for claim conflicts, hold conversion, reaper volume, oversells, and cache hit rate.

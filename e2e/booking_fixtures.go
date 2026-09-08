@@ -270,6 +270,37 @@ func (h *Harness) PaymentSummary() PaymentSummary {
 	return out
 }
 
+// IntegrityReport is a direct audit of an event's inventory, computed from the
+// authoritative tables rather than from any counter or cache.
+type IntegrityReport struct {
+	EventID   int64 `json:"event_id"`
+	Total     int64 `json:"total"`
+	Available int64 `json:"available"`
+	Held      int64 `json:"held"`
+	Sold      int64 `json:"sold"`
+
+	DuplicateSeats             int64 `json:"duplicate_seats"`
+	SoldWithoutBooking         int64 `json:"sold_without_booking"`
+	HeldWithoutHold            int64 `json:"held_without_hold"`
+	ConfirmedBookings          int64 `json:"confirmed_bookings"`
+	TicketsInConfirmedBookings int64 `json:"tickets_in_confirmed_bookings"`
+	UnresolvedCompensations    int64 `json:"unresolved_compensations"`
+
+	Consistent bool `json:"consistent"`
+}
+
+// Integrity audits an event's inventory.
+func (h *Harness) Integrity(eventID int64) IntegrityReport {
+	h.t.Helper()
+	resp, err := h.Get(pathf("/_test/integrity/%d", eventID), nil)
+	require.NoError(h.t, err)
+	require.Equal(h.t, http.StatusOK, resp.Status, "integrity: %s", resp.Body)
+
+	var out IntegrityReport
+	require.NoError(h.t, resp.DecodeInto(&out))
+	return out
+}
+
 // SeedSellableEvent is the standard setup for booking tests: an on-sale event with a
 // small, fully available seat map.
 func (h *Harness) SeedSellableEvent(t *testing.T, rows, seatsPerRow int, priceCents int64) int64 {

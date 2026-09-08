@@ -75,13 +75,34 @@ Two testing choices worth knowing about:
 | 4 | Holds — the contention core | ✅ done |
 | 5 | Purchase and the payment saga | ✅ done |
 | 6 | Hold expiry reaper | ✅ done |
-| 7 | Read-path hardening (cache, ETag, read model) | ⬜ planned |
-| 8 | Load proof — zero oversell under concurrency | ⬜ planned |
+| 7 | Read-path hardening (versioned cache, ETag, single-flight) | ✅ done |
+| 8 | Load proof — zero oversell under concurrency | ✅ done |
 
-Steps 7–8 are fully specified in the implementation plan but not yet built.
+## The invariant, proven
 
-The zero-oversell invariant is **proven by tests**: 32 goroutines racing for one seat yield exactly one
-winner, and a 40-seat concurrent sellout claims every seat exactly once with none stranded. What is not yet
-proven is behaviour under *sustained* onsale load — that is Step 8. The read path also still lacks its cache,
-versioned keys and read model (Step 7), so availability is computed per request: correct, but not at the
-80k RPS target.
+The system exists to guarantee one thing: **a seat has at most one owner**. That is not asserted, it is
+tested at three levels.
+
+**Unit, under maximal contention** — 32 goroutines released simultaneously at a single seat yield exactly
+one winner and 31 clean conflicts. Overlapping multi-seat claims submitted in *opposite* orders never
+deadlock; remove the `ORDER BY ticket_id` from the locking read and that test fails with
+`deadlock detected`.
+
+**End to end** — a sold seat can never be held again; a declined payment releases seats; an ambiguous
+provider failure releases nothing.
+
+**Load proof** (`make loadproof`) — a 5,000-seat event sold out through the real HTTP stack by 60 concurrent
+workers:
+
+```
+holds created   : 625
+hold conflicts  : 481        <- real contention, not a serialised run
+purchases ok    : 625
+other errors    : 0
+Total:5000  Available:0  Held:0  Sold:5000
+DuplicateSeats:0  SoldWithoutBooking:0  HeldWithoutHold:0  UnresolvedCompensations:0
+ConfirmedBookings:625  TicketsInConfirmedBookings:5000  Consistent:true
+```
+
+Every seat sold exactly once, none stranded, no oversell — with 481 genuine conflicts along the way. The
+test fails if no conflicts occur, because a run without contention would prove nothing.

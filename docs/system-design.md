@@ -320,15 +320,27 @@ retry. Accepted — partial holds are a worse experience and complicate pricing.
 
 Read-scaling ladder applied in order, stopping where the SLO is met:
 
-1. **Indexes + keyset pagination** — no `OFFSET`, no full scans.
-2. **Denormalized read model** — `event_view` carries venue and tier summary pre-joined, so event detail is
-   a single primary-key lookup.
-3. **Versioned cache keys** — `events.version` is incremented **in the same transaction** as any event
+1. **Indexes + keyset pagination** — no `OFFSET`, no full scans. ✅ built
+2. **Versioned cache keys** — `events.version` is incremented **in the same transaction** as any event
    update, and the version is part of the cache key. Old keys become unreachable and expire naturally, so
-   there is **no invalidation race and no explicit purge**.
-4. **Read replicas** for catalog and seat map. **Never** for a claim.
-5. **CDN** on `GET /v1/events/:id` with short TTL + ETag. The ~18GB catalog fits comfortably.
-6. **Sharding: deferred**, with `event_id` recorded as the partition key.
+   there is **no invalidation race and no explicit purge**. ✅ built
+3. **Separate availability cache**, keyed without a version, 5s TTL, because availability changes on every
+   sale without the event changing (D21). Sales deliberately do not invalidate it (D22). ✅ built
+4. **Single-flight rebuilds** so one popular key expiring does not send every in-flight request to
+   Postgres. ✅ built
+5. **Bounded database fallback** (64 slots, shed beyond) so a cache outage cannot become a database
+   outage (D24). ✅ built
+6. **HTTP validators** — ETag + `If-None-Match` → 304, plus `Cache-Control: public, max-age=5`, so a CDN
+   and browsers revalidate without transferring a body (D23). ✅ built
+7. **A denormalized `event_view` table** — deliberately *not* built; the versioned cache subsumes it, with
+   a named trigger to revisit (D26).
+8. **Read replicas** for catalog and seat map, **never** for a claim — deferred.
+9. **CDN in front of the origin** — deferred; the origin now emits the validators a CDN needs.
+10. **Sharding** — deferred, with `event_id` recorded as the partition key.
+
+The seat map is deliberately **not** cached: it is per-seat, changes constantly during an onsale, and is the
+read most likely to be acted on immediately, so caching it would widen the window in which a client picks a
+seat that is already gone.
 
 **The load-bearing decision:** availability reads are *deliberately* not strongly consistent. The seat map is
 advisory; only the conditional write is authoritative. This is what makes the read path cacheable at all.
@@ -379,9 +391,23 @@ Order of operations on the money path:
 
 ## 9. Observability
 
-Metrics that identify the actual bottleneck: claim conflict rate, hold conversion rate, holds reaped,
-oversell counter (**must remain exactly zero**), payment `IN_PROGRESS` age, compensation count, cache hit
-rate, search p95, replica lag.
+Metrics emitted (`encore.dev/metrics`), chosen so each one would change a decision:
+
+| Metric | What it tells you |
+|---|---|
+| `booking_claim_conflicts` | How contended an onsale actually is — the trigger for the waiting room (D12) |
+| `booking_holds_created` / `_converted` / `_released` | Conversion funnel; a falling conversion rate means checkout is broken |
+| `booking_tickets_reaped` | How much inventory abandoned carts are tying up |
+| `booking_payments_failed` | Decline rate, distinct from provider errors |
+| `booking_compensations` | **Charged but undeliverable.** Any non-zero value is money owed back |
+| `catalog_cache_hits` / `_misses` / `_errors` | Hit rate, and cache-down distinguished from cache-cold |
+| `catalog_load_shed` | Reads rejected to protect the database — the cache-outage signal |
+
+**Inventory integrity** is auditable on demand rather than inferred from counters:
+`GET /internal/booking/integrity/:eventID` recomputes, from the authoritative tables, the seat totals, any
+seat represented by more than one ticket row (the direct oversell check), sold tickets with no booking, held
+tickets with no hold, and bookings stuck mid-compensation. It returns a single `consistent` flag. The load
+proof asserts on it, and an operator can call it during an incident.
 
 ## 10. Known limitations and deferred work
 

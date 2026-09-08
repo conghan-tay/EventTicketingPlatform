@@ -451,22 +451,160 @@ coupling that makes it correct.
 
 ---
 
-## D13 — Build scope limited to Steps 0–6
+## D21 — Two caches: versioned event view, unversioned availability
 
-**Context / requirement:** The user scoped the build in two passes: Steps 0–3 (catalog and search) first,
-then Steps 4–6 (the booking path).
+**Context / requirement:** Event detail must be cacheable at 80k RPS, but it embeds an availability count
+that changes on every sale.
 
-**Chosen approach:** Steps 0–6 are built: scaffold, E2E harness, catalog, search, holds, purchase saga, and
-the expiry reaper. Steps 7–8 (read-path hardening, load proof) remain planned and specified but unbuilt.
+**Chosen approach:** Two separate cache entries. The **event view** is keyed on `(event_id, version)` with a
+30-minute TTL. **Availability** is keyed on `event_id` alone with a 5-second TTL.
 
-**Why it fits:** Each step leaves the system working and independently testable, so stopping after Step 6
-yields a coherent, green, demonstrable system: an event can be created, found, held, bought and — if
-abandoned — returned to sale.
+**Why it fits:** `events.version` is incremented in the same transaction as any edit, so a versioned key
+makes invalidation free — the old key simply becomes unreachable, with no purge and no delete-on-write race.
+That only works for data which changes when the event changes. Availability changes without the event
+changing, so a versioned key would never invalidate it. Combining the two into one entry would force either
+a useless TTL on the event body or a permanently stale count.
 
-**Tradeoffs and consequences:** The zero-oversell invariant is now **proven by tests** at the unit level
-(concurrent claims on one seat yield exactly one winner; a 40-seat concurrent sellout claims every seat
-exactly once) but not yet at scale — the sustained onsale load proof is Step 8. The read path still has no
-cache, versioned keys, ETag or read model; that is Step 7. Availability is therefore computed per request,
-which is correct but not at the 80k RPS target.
+**Alternatives considered:** One cache entry for the whole response — simpler, but the TTL would have to be
+5s, discarding the benefit of a version-keyed body. No availability cache — correct but puts an aggregation
+query on every read.
+
+**Tradeoffs and consequences:** Two lookups per event read instead of one, plus one indexed primary-key read
+for the version. Availability is up to 5s stale, which D4 already accepts.
+
+**Status:** accepted
+
+---
+
+## D22 — Sales do not invalidate the availability cache
+
+**Context / requirement:** A sale makes the cached availability count wrong. The obvious reaction is to
+invalidate on write.
+
+**Chosen approach:** Do not invalidate. Let the 5-second TTL expire, with single-flight collapsing the
+rebuild.
+
+**Why it fits:** At ~1k claims/s on a hot event, invalidate-on-write would delete and rebuild the same key
+about a thousand times a second. That is a stampede, not a cache — and it degrades precisely when load is
+highest, which is the opposite of what a cache is for. A TTL bounds rebuilds to once per interval regardless
+of sale rate. Availability is advisory anyway (D4), so bounded staleness costs nothing real.
+
+**Alternatives considered:** Delete-on-write — intuitive and wrong at this write rate. Write-through updates
+from the booking service — couples the inventory writer to the read cache for a number that is advisory.
+
+**Tradeoffs and consequences:** A buyer may see a count up to 5s old. They may therefore pick a seat that is
+gone and get a `SEAT_UNAVAILABLE` conflict — already an expected, well-handled path.
+A manual force-refresh endpoint exists for operator corrections.
+
+**Status:** accepted
+
+---
+
+## D23 — Event detail is a raw endpoint, for HTTP validators
+
+**Context / requirement:** At 80k RPS the cheapest possible response is one with no body. That needs ETag
+and `If-None-Match` handling, including returning 304.
+
+**Chosen approach:** `GET /v1/events/:eventID` is an Encore **raw** endpoint. Every other endpoint stays typed.
+
+**Why it fits:** A typed Encore endpoint cannot return 304 — it maps a return value or an error to a status,
+and 304 is neither. Revalidation is the entire point of this layer, so the one endpoint that needs it gets
+raw treatment and the rest keep their typed contracts.
+
+The ETag covers the **whole representation**, event version *and* availability numbers. Deriving it from the
+version alone would be cheaper, but a 304 would then hide a sold-out section from a client revalidating a
+ticketing page — the one thing they opened it to check.
+
+**Alternatives considered:** Typed endpoint with ETag response header but no 304 — loses the bandwidth saving
+that motivates the header. Version-only ETag — cheaper and wrong, as above.
+
+**Tradeoffs and consequences:** Path parameters and error rendering are hand-written for this endpoint; the
+error envelope is reproduced to match Encore's typed shape so clients see one format. Computing the ETag
+requires building the body, so a 304 saves bandwidth rather than work — normal ETag semantics.
+
+**Status:** accepted
+
+---
+
+## D24 — Cache failure sheds load rather than falling through freely
+
+**Context / requirement:** If the cache tier is unavailable, every read wants to rebuild from Postgres.
+
+**Chosen approach:** Cache misses and cache *errors* are counted separately. Rebuilds run through a
+64-slot semaphore; requests that cannot get a slot are shed with `Unavailable` rather than queued.
+
+**Why it fits:** An unrestricted fallback converts a cache outage into a database outage, which is strictly
+worse — the cache is optional and Postgres is not. Shedding a fraction of reads keeps the booking path,
+which shares that database, alive. Failing fast also beats queueing, which would collapse latency for
+everyone.
+
+**Alternatives considered:** Unbounded fallback — the default, and the mistake the read-scaling playbook
+names explicitly. Serving stale-on-error — no stale copy exists once the cache is the thing that is down.
+
+**Tradeoffs and consequences:** During a cache outage some catalog reads fail. Accepted: browse degrades,
+booking survives.
+
+**Status:** accepted
+
+---
+
+## D25 — The load proof fails if it observes no contention
+
+**Context / requirement:** A concurrency test that happens to serialise proves nothing, but still passes.
+
+**Chosen approach:** The load proof asserts `hold_conflicts > 0` alongside the invariant, and workers
+deliberately target already-claimed seats ~35% of the time instead of only taking untouched batches.
+
+**Why it fits:** Without the spoiler behaviour, a work queue hands each seat to exactly one worker and no
+conflict can occur — the test would report success while exercising none of the contention machinery. The
+observed run produces ~481 conflicts against 625 successful holds, so the conflict path is genuinely covered.
+
+**Tradeoffs and consequences:** The conflict count varies between runs, so the assertion is "> 0" rather
+than an exact figure. A sequential drain phase finishes any inventory the concurrent phase left, so the final
+invariant check is deterministic rather than "almost sold out".
+
+**Status:** accepted
+
+---
+
+## D13 — Build complete through Step 8
+
+**Context / requirement:** The build ran in three passes: Steps 0–3 (catalog and search), Steps 4–6 (the
+booking path), then Steps 7–8 (read path and load proof).
+
+**Chosen approach:** All eight steps are built and green.
+
+**Tradeoffs and consequences:** The zero-oversell invariant is proven at three levels: unit tests under
+maximal single-row contention, E2E tests through the HTTP stack, and a 5,000-seat concurrent sellout load
+proof that reports zero oversells and zero stranded seats with 481 genuine conflicts along the way.
+
+**What remains deliberately unbuilt**, each with a named trigger recorded above: the virtual waiting room
+(D12), OpenSearch (D6), Temporal for long-lived flows (D7), a separate `event_view` table (D26), read
+replicas, a CDN, `tickets` sharding, and multi-region. The development auth handler (D14) and the
+unconfigured payment provider must both be replaced before any real deployment; both fail closed.
+
+**Status:** accepted
+
+---
+
+## D26 — No separate `event_view` table; the versioned cache subsumes it
+
+**Context / requirement:** The plan for Step 7 listed a denormalized `event_view` table alongside the cache.
+Reconsidered while building.
+
+**Chosen approach:** Skip the table. The cached projection is assembled by two queries on a cache miss and
+stored under the versioned key.
+
+**Why it fits:** With a version-keyed cache the hit rate on a ~18GB catalog is very high, so a materialized
+table would only reduce the cost of a *miss* — which is not the bottleneck. Against that, the table needs a
+second write path kept correct on publish, on edit, and on any venue change, which is real ongoing risk for
+no measured gain. The read-scaling ladder says to stop at the rung that meets the SLO.
+
+**Alternatives considered:** Building the table as planned — more faithful to the plan, but adds an
+invalidation surface the versioned cache was chosen specifically to avoid.
+
+**Tradeoffs and consequences:** A cache miss costs two queries instead of one indexed read.
+**Named trigger to revisit:** when cache-miss rebuild latency, rather than hit-path latency, appears in the
+p99 for `GET /v1/events/:id`.
 
 **Status:** accepted

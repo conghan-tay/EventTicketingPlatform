@@ -1,4 +1,4 @@
-.PHONY: run test e2e fmt check clean
+.PHONY: run test e2e loadproof fmt check clean
 
 # Boot the app with local Postgres + Redis provisioned by Encore.
 run:
@@ -11,6 +11,11 @@ test:
 # End-to-end suite. Boots the app, waits for /health, runs the HTTP tests, tears down.
 e2e:
 	./scripts/e2e.sh
+
+# The load proof: sell out a 5,000-seat event under concurrency and assert the
+# central invariant. Separate from `e2e` because it takes tens of seconds.
+loadproof:
+	./scripts/loadproof.sh
 
 fmt:
 	go fmt ./...
