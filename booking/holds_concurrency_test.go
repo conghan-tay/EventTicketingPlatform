@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"encore.app/internal/clock"
+	"encore.app/store"
 )
 
 // These tests are the reason the API handlers delegate to unexported methods taking a
@@ -26,13 +27,41 @@ func newTestService() *Service {
 	return &Service{clock: clock.Real{}}
 }
 
+// freshDB empties the database before a test.
+//
+// Encore reuses one test database across a package, and two things here are global by
+// nature: the reaper sweeps every expired hold regardless of event, and the per-user
+// hold quota counts a user's holds across all events. Without a clean slate, a test
+// would see leftovers from its predecessors — which is exactly how the first run of
+// these tests failed.
+func freshDB(ctx context.Context, t *testing.T) {
+	t.Helper()
+	require.NoError(t, store.TruncateAll(ctx))
+}
+
+// frozenClock returns a clock stopped at a fixed instant.
+//
+// An untouched Controllable still tracks real time, so asserting on an exact expiry
+// against one drifts by however long the test took. Freezing removes that.
+func frozenClock() *clock.Controllable {
+	c := clock.NewControllable()
+	c.Set(time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC))
+	return c
+}
+
 // seedEvent creates a venue, an on-sale event and materialised tickets, returning the
 // event id and its ticket ids.
 //
 // It writes SQL directly rather than calling the organizer service, so these tests
 // depend only on the schema.
-func seedEvent(ctx context.Context, t *testing.T, seatCount int) (int64, []int64) {
+//
+// The event window is derived from svc's clock, not SQL now(). A frozen test clock
+// sits months away from real time, so seeding with now() produced an event that was
+// "not yet on sale" as far as the service was concerned. Taking the service makes
+// that mismatch impossible to reintroduce.
+func seedEvent(ctx context.Context, t *testing.T, svc *Service, seatCount int) (int64, []int64) {
 	t.Helper()
+	now := svc.clock.Now()
 
 	// A unique venue name per test keeps concurrent tests from colliding, since
 	// Encore reuses one test database by default.
@@ -41,9 +70,9 @@ func seedEvent(ctx context.Context, t *testing.T, seatCount int) (int64, []int64
 	var venueID int64
 	require.NoError(t, db.QueryRow(ctx, `
 		INSERT INTO venues (name, city, country, created_at)
-		VALUES ($1, 'London', 'GB', now())
+		VALUES ($1, 'London', 'GB', $2)
 		RETURNING venue_id
-	`, "Test Venue "+suffix).Scan(&venueID))
+	`, "Test Venue "+suffix, now).Scan(&venueID))
 
 	sections := make([]string, seatCount)
 	rowLabels := make([]string, seatCount)
@@ -64,11 +93,11 @@ func seedEvent(ctx context.Context, t *testing.T, seatCount int) (int64, []int64
 	require.NoError(t, db.QueryRow(ctx, `
 		INSERT INTO events (venue_id, organizer_id, title, category, status,
 		                    starts_at, ends_at, onsale_at, created_at, updated_at)
-		VALUES ($1, 'org-test', $2, 'MUSIC', 'ON_SALE',
-		        now() + interval '30 days', now() + interval '30 days 3 hours',
-		        now() - interval '1 hour', now(), now())
+		VALUES ($1, 'org-test', $2, 'MUSIC', 'ON_SALE', $3, $4, $5, $6, $6)
 		RETURNING event_id
-	`, venueID, "Test Event "+suffix).Scan(&eventID))
+	`, venueID, "Test Event "+suffix,
+		now.Add(30*24*time.Hour), now.Add(30*24*time.Hour+3*time.Hour),
+		now.Add(-time.Hour), now).Scan(&eventID))
 
 	var tierID int64
 	require.NoError(t, db.QueryRow(ctx, `
@@ -117,8 +146,9 @@ func ticketStatus(ctx context.Context, t *testing.T, ticketID int64) (string, *s
 // E2E test, which cannot drive genuinely simultaneous claims against one row.
 func TestConcurrentClaimsOnOneSeatYieldExactlyOneWinner(t *testing.T) {
 	ctx := context.Background()
+	freshDB(ctx, t)
 	svc := newTestService()
-	eventID, tickets := seedEvent(ctx, t, 1)
+	eventID, tickets := seedEvent(ctx, t, svc, 1)
 	seat := tickets[0]
 
 	const racers = 32
@@ -172,8 +202,9 @@ func TestConcurrentClaimsOnOneSeatYieldExactlyOneWinner(t *testing.T) {
 // fails with "deadlock detected" rather than clean conflicts.
 func TestOverlappingMultiSeatClaimsDoNotDeadlock(t *testing.T) {
 	ctx := context.Background()
+	freshDB(ctx, t)
 	svc := newTestService()
-	eventID, tickets := seedEvent(ctx, t, 6)
+	eventID, tickets := seedEvent(ctx, t, svc, 6)
 
 	// Two overlapping sets, deliberately requested in opposite orders.
 	ascending := []int64{tickets[0], tickets[1], tickets[2], tickets[3]}
@@ -227,8 +258,9 @@ func TestOverlappingMultiSeatClaimsDoNotDeadlock(t *testing.T) {
 // client was told does not exist.
 func TestPartialAvailabilityRollsBackCompletely(t *testing.T) {
 	ctx := context.Background()
+	freshDB(ctx, t)
 	svc := newTestService()
-	eventID, tickets := seedEvent(ctx, t, 5)
+	eventID, tickets := seedEvent(ctx, t, svc, 5)
 
 	// Take one seat out of circulation.
 	taken, err := svc.createHold(ctx, "first-buyer", eventID,
@@ -271,10 +303,11 @@ func TestPartialAvailabilityRollsBackCompletely(t *testing.T) {
 // no oversell, and no seat stranded unclaimed.
 func TestConcurrentSelloutClaimsEverySeatExactlyOnce(t *testing.T) {
 	ctx := context.Background()
+	freshDB(ctx, t)
 	svc := newTestService()
 
 	const seats = 40
-	eventID, tickets := seedEvent(ctx, t, seats)
+	eventID, tickets := seedEvent(ctx, t, svc, seats)
 
 	var (
 		wg sync.WaitGroup
@@ -326,10 +359,11 @@ func TestConcurrentSelloutClaimsEverySeatExactlyOnce(t *testing.T) {
 // An expired lease must be claimable immediately, and only one racer may take it over.
 func TestConcurrentTakeoverOfExpiredHold(t *testing.T) {
 	ctx := context.Background()
-	testClock := clock.NewControllable()
+	freshDB(ctx, t)
+	testClock := frozenClock()
 	svc := &Service{clock: testClock}
 
-	eventID, tickets := seedEvent(ctx, t, 1)
+	eventID, tickets := seedEvent(ctx, t, svc, 1)
 	seat := tickets[0]
 
 	_, err := svc.createHold(ctx, "abandoner", eventID, &CreateHoldRequest{TicketIDs: []int64{seat}})

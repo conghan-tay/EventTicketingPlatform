@@ -72,11 +72,16 @@ Two testing choices worth knowing about:
 | 1 | E2E harness + testsupport service | ✅ done |
 | 2 | Catalog vertical slice (venues, events, publish, event detail) | ✅ done |
 | 3 | Search (text, date, location, category, cursor pagination) | ✅ done |
-| 4 | Holds — the contention core | ⬜ planned |
-| 5 | Purchase and the payment saga | ⬜ planned |
-| 6 | Hold expiry reaper | ⬜ planned |
+| 4 | Holds — the contention core | ✅ done |
+| 5 | Purchase and the payment saga | ✅ done |
+| 6 | Hold expiry reaper | ✅ done |
 | 7 | Read-path hardening (cache, ETag, read model) | ⬜ planned |
 | 8 | Load proof — zero oversell under concurrency | ⬜ planned |
 
-Steps 4–8 are fully specified in the implementation plan but not yet built. The central invariant (zero
-oversell) is therefore **designed but not yet proven by tests** — that is Step 8's job.
+Steps 7–8 are fully specified in the implementation plan but not yet built.
+
+The zero-oversell invariant is **proven by tests**: 32 goroutines racing for one seat yield exactly one
+winner, and a 40-seat concurrent sellout claims every seat exactly once with none stranded. What is not yet
+proven is behaviour under *sustained* onsale load — that is Step 8. The read path also still lacks its cache,
+versioned keys and read model (Step 7), so availability is computed per request: correct, but not at the
+80k RPS target.

@@ -3,7 +3,7 @@
 Derived from `system-design.md` and `decisions.md`. Progress is marked as steps complete.
 Last updated: 2026-09-08
 
-**Current build scope: Steps 0–3** (see D13). Steps 4–8 are specified but not built.
+**Current build scope: Steps 0–6** (see D13). Steps 7–8 are specified but not built.
 
 ---
 
@@ -68,10 +68,14 @@ Only where an E2E test cannot economically reach an important case.
 | Cursor encode/decode round-trip + tamper rejection | Branch-heavy; silent failure would corrupt pagination | 3 |
 | Seat-map materialization arithmetic | Off-by-one in section/row/seat generation is silent | 2 |
 | Search query builder — filter combinations | Combinatorial; an E2E per combination is wasteful | 3 |
-| **Concurrent claim: N goroutines, one seat → exactly one winner** | Unreachable via E2E | 4 |
-| **Overlapping multi-seat claims never deadlock** | Unreachable via E2E | 4 |
-| **Reaper leaves a SOLD ticket sold** | Hard-to-reach state | 6 |
-| **Charge succeeds while hold expires → `COMPENSATING`** | Hard-to-reach state; money-losing if wrong | 5 |
+| Concurrent claim: N goroutines, one seat → exactly one winner | Unreachable via E2E | 4 ✅ |
+| Overlapping multi-seat claims never deadlock | Unreachable via E2E | 4 ✅ |
+| Concurrent sellout claims every seat exactly once | Unreachable via E2E | 4 ✅ |
+| Concurrent takeover of an expired lease has one winner | Unreachable via E2E | 4 ✅ |
+| Reaper leaves a SOLD ticket sold | Hard-to-reach state | 6 ✅ |
+| Concurrent reapers release each seat once (SKIP LOCKED) | Unreachable via E2E | 6 ✅ |
+| Charge succeeds while hold expires → `COMPENSATING` | Hard-to-reach state; money-losing if wrong | 5 ✅ |
+| Refund failure leaves the booking `COMPENSATING` | Compensation is fallible | 5 ✅ |
 
 ---
 
@@ -176,7 +180,7 @@ migrations), `testcontainers-go` (`encore test` provisions test databases), `go-
 
 ---
 
-### Step 4 — Holds (the contention core) — ☐ *not in current scope*
+### Step 4 — Holds (the contention core) — ✅ done
 
 **What to build:** `POST /v1/events/:id/holds` with the ordered-`FOR UPDATE` all-or-nothing claim, hold
 token, per-user seat limit, `Idempotency-Key` handling; `GET`/`DELETE /v1/holds/:id`.
@@ -188,7 +192,7 @@ back completely.
 
 ---
 
-### Step 5 — Purchase and the payment saga — ☐ *not in current scope*
+### Step 5 — Purchase and the payment saga — ✅ done
 
 **What to build:** `payments` with an injectable mock provider (scriptable to succeed/fail/hang), idempotent
 effect record, token-fenced `HELD → SOLD` conversion in the same transaction as the booking insert and
@@ -200,7 +204,7 @@ charge succeeding while the hold expires lands in `COMPENSATING`.
 
 ---
 
-### Step 6 — Hold expiry reaper — ☐ *not in current scope*
+### Step 6 — Hold expiry reaper — ✅ done
 
 **What to build:** `POST /internal/holds/reap` with the `SKIP LOCKED` fenced query; `cron.NewJob` wired for
 cloud only (D10).

@@ -379,20 +379,94 @@ search results. Harmless, and equivalent to what they could achieve with date fi
 
 ---
 
-## D13 — Build scope limited to Steps 0–3
+## D18 — A provider transport error must not release the seats
 
-**Context / requirement:** The user scoped the initial build to catalog and search, stopping before the
-booking path.
+**Context / requirement:** A charge can fail two very different ways: a **decline** (the provider says no —
+a definite outcome) or a **transport error** (no answer — the money may or may not have moved). Discovered
+while building the purchase saga.
 
-**Chosen approach:** Implement Steps 0–3 (scaffold, E2E harness + testsupport, catalog vertical slice,
-search). Steps 4–8 (holds, purchase saga, reaper, read-path hardening, load proof) remain planned and
-specified but unbuilt.
+**Chosen approach:** A decline releases the seats immediately and records a `FAILED` booking. A transport
+error releases **nothing**: the payment row stays `IN_PROGRESS`, the hold stays intact, and the caller gets
+`Unavailable`.
 
-**Why it fits:** Each step leaves the system working and independently testable, so stopping after Step 3
-yields a coherent, green, demonstrable system rather than a half-built booking path.
+**Why it fits:** Releasing seats while a charge may still land is how you sell one seat twice and refund
+neither. Leaving the hold alone costs at most one abandoned lease, which the reaper cleans up; guessing
+wrong costs real money and a double sale. `IN_PROGRESS` is therefore treated as genuinely ambiguous and
+never as "not yet done".
 
-**Tradeoffs and consequences:** The central invariant (zero oversell) is designed and specified but **not yet
-proven by tests** — that is Step 8's job. The schema for `tickets`/`holds` is created in Step 2 so the
-booking path can be added without a migration rewrite.
+**Alternatives considered:** Treating any charge failure as a decline — simpler and wrong. Retrying the
+charge on transport error — cannot be done safely without first reconciling, since the original may have
+succeeded.
+
+**Tradeoffs and consequences:** Seats stay locked for up to the remaining TTL after an ambiguous failure,
+and resolving the payment needs the reconcile job. Accepted: it fails in the direction that does not lose
+money.
+
+**Status:** accepted
+
+---
+
+## D19 — A test seam for the charged-but-seats-lost interleaving
+
+**Context / requirement:** The system's worst money-losing failure — the charge succeeds, then the seats turn
+out to be gone — is unreachable sequentially. Something must steal the seats *while* the payment is in
+flight.
+
+**Chosen approach:** An unexported package variable `duringPaymentHook func()` in the booking service, nil
+in every real environment, invoked between the charge and the conversion. Tests set it to reassign the seats
+mid-payment.
+
+**Why it fits:** The alternative was leaving the compensation path untested, which for the one path that
+loses customer money is not acceptable. The seam is unexported, nil-checked, zero-cost, and documented at
+its definition.
+
+**Alternatives considered:** Testing `convertToSold` and `compensate` in isolation — proves the pieces but
+not that `purchase` actually composes them. Driving a real race with goroutines — inherently flaky, and it
+would not reliably hit the window.
+
+**Tradeoffs and consequences:** A test-only branch in production code. Bounded and explicit, and the payoff
+is that `COMPENSATING` and the fallible-refund path are both genuinely exercised.
+
+**Status:** accepted
+
+---
+
+## D20 — Test seeds derive time from the injected clock, never SQL `now()`
+
+**Context / requirement:** Found by a failing test. The booking unit tests froze the clock at a fixed date,
+while the test seed created events with `onsale_at = now() - interval '1 hour'` using SQL `now()`. The
+service compared its frozen clock against a real-time `onsale_at` months away and refused every claim with
+"tickets are not yet on sale".
+
+**Chosen approach:** The seed helper takes the `*Service` and derives all timestamps from `svc.clock.Now()`,
+so seed and service cannot disagree by construction.
+
+**Why it fits:** This is the same class of bug D11 warns about, arriving from the test side. Passing the
+service makes the mismatch impossible to reintroduce rather than relying on a reviewer noticing.
+
+**Tradeoffs and consequences:** The seed helper is coupled to the service under test, which is precisely the
+coupling that makes it correct.
+
+**Status:** accepted
+
+---
+
+## D13 — Build scope limited to Steps 0–6
+
+**Context / requirement:** The user scoped the build in two passes: Steps 0–3 (catalog and search) first,
+then Steps 4–6 (the booking path).
+
+**Chosen approach:** Steps 0–6 are built: scaffold, E2E harness, catalog, search, holds, purchase saga, and
+the expiry reaper. Steps 7–8 (read-path hardening, load proof) remain planned and specified but unbuilt.
+
+**Why it fits:** Each step leaves the system working and independently testable, so stopping after Step 6
+yields a coherent, green, demonstrable system: an event can be created, found, held, bought and — if
+abandoned — returned to sale.
+
+**Tradeoffs and consequences:** The zero-oversell invariant is now **proven by tests** at the unit level
+(concurrent claims on one seat yield exactly one winner; a 40-seat concurrent sellout claims every seat
+exactly once) but not yet at scale — the sustained onsale load proof is Step 8. The read path still has no
+cache, versioned keys, ETag or read model; that is Step 7. Availability is therefore computed per request,
+which is correct but not at the 80k RPS target.
 
 **Status:** accepted

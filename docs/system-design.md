@@ -339,11 +339,33 @@ cache outage cannot become an unbounded database stampede.
 
 ### 7.3 Payment saga
 
-Shape: two local commits with a compensation — a **saga**, not a workflow engine. See
-`decisions.md` for the Temporal evaluation and the named trigger to revisit.
+Shape: two local commits with a compensation — a **saga**, not a workflow engine. See `decisions.md` for the
+Temporal evaluation and the named trigger to revisit.
 
 The payment effect record is keyed on a unique `idempotency_key`, and `IN_PROGRESS` is treated as
 **ambiguous**: reconcile against the provider, never blind-retry an irreversible charge.
+
+**The two failure modes are not the same thing** (D18):
+
+| Charge outcome | Meaning | Seats |
+|---|---|---|
+| Declined | Definite "no" from the provider | Released immediately; booking `FAILED` |
+| Transport error | No answer — money may or may not have moved | **Not released.** Hold stays intact, payment stays `IN_PROGRESS` |
+
+Releasing seats while a charge may still land is how one seat gets sold twice with neither buyer refunded.
+An abandoned lease costs one reaper cycle; guessing wrong costs money.
+
+Order of operations on the money path:
+
+1. Verify ownership **and** the fence token before anything else — a rejected purchase never reaches the
+   provider.
+2. Price from the tickets *still carrying this hold*, so a seat taken over cannot be charged for.
+3. Extend the lease if less than `PaymentBudget` (60s) remains (D9).
+4. Charge, entirely outside every transaction.
+5. Convert `HELD → SOLD` fenced on `hold_id`, in the same transaction as the booking insert and the outbox
+   row. Fewer rows affected than expected ⇒ roll back and compensate.
+6. On compensation: record `COMPENSATING` **before** attempting the refund, so the obligation survives a
+   refund failure or a crash. A failed refund stays `COMPENSATING` rather than being marked resolved.
 
 ---
 

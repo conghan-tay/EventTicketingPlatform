@@ -12,7 +12,9 @@ import (
 
 	"encore.dev/beta/errs"
 
+	"encore.app/booking"
 	"encore.app/internal/clock"
+	"encore.app/payments"
 	"encore.app/store"
 )
 
@@ -32,8 +34,9 @@ type ResetResponse struct {
 	Truncated bool `json:"truncated"`
 }
 
-// Reset empties every application table and returns the clock to real time. Called
-// between E2E tests so each starts from a known state.
+// Reset empties every application table, returns the clock to real time, and restores
+// the mock payment provider. Called between E2E tests so each starts from a known
+// state — including the provider, or a scripted decline would leak into later tests.
 //
 //encore:api public method=POST path=/_test/reset
 func Reset(ctx context.Context) (*ResetResponse, error) {
@@ -45,6 +48,9 @@ func Reset(ctx context.Context) (*ResetResponse, error) {
 	}
 	if c, ok := clock.Testable(); ok {
 		c.Reset()
+	}
+	if _, err := payments.ResetTestProvider(ctx); err != nil {
+		return nil, err
 	}
 	return &ResetResponse{Truncated: true}, nil
 }
@@ -132,4 +138,74 @@ func Stats(ctx context.Context) (*StatsResponse, error) {
 		return nil, err
 	}
 	return &StatsResponse{Tables: s.Tables}, nil
+}
+
+type PaymentBehaviourRequest struct {
+	// Mode is one of succeed, decline, error, refund_fails.
+	Mode string `json:"mode"`
+}
+
+type PaymentBehaviourResponse struct {
+	Mode string `json:"mode"`
+}
+
+// SetPaymentBehaviour scripts the mock payment provider so the sad paths of the
+// purchase saga are deterministic rather than dependent on a real gateway.
+//
+//encore:api public method=POST path=/_test/payments/behaviour
+func SetPaymentBehaviour(ctx context.Context, req *PaymentBehaviourRequest) (*PaymentBehaviourResponse, error) {
+	if err := requireControllableEnv(); err != nil {
+		return nil, err
+	}
+	out, err := payments.SetTestBehaviour(ctx, &payments.SetBehaviourRequest{Mode: req.Mode})
+	if err != nil {
+		return nil, err
+	}
+	return &PaymentBehaviourResponse{Mode: out.Mode}, nil
+}
+
+type PaymentSummaryResponse struct {
+	Charges int `json:"charges"`
+	Refunds int `json:"refunds"`
+}
+
+// PaymentSummary reports provider call counts, so a test can prove a card was charged
+// exactly once across a retry.
+//
+//encore:api public method=GET path=/_test/payments/summary
+func PaymentSummary(ctx context.Context) (*PaymentSummaryResponse, error) {
+	if err := requireControllableEnv(); err != nil {
+		return nil, err
+	}
+	out, err := payments.TestSummary(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &PaymentSummaryResponse{Charges: out.Charges, Refunds: out.Refunds}, nil
+}
+
+type ReapResponse struct {
+	TicketsReleased int64 `json:"tickets_released"`
+	HoldsExpired    int64 `json:"holds_expired"`
+}
+
+// ReapHolds runs the expiry reaper on demand.
+//
+// Encore cron jobs do not fire locally or in preview environments (D10), so this
+// guarded proxy is how tests drive expiry. It is also how an operator would force a
+// sweep.
+//
+//encore:api public method=POST path=/_test/reap-holds
+func ReapHolds(ctx context.Context) (*ReapResponse, error) {
+	if err := requireControllableEnv(); err != nil {
+		return nil, err
+	}
+	out, err := booking.ReapExpiredHolds(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &ReapResponse{
+		TicketsReleased: out.TicketsReleased,
+		HoldsExpired:    out.HoldsExpired,
+	}, nil
 }
