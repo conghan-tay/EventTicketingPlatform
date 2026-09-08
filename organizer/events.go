@@ -149,6 +149,74 @@ func (s *Service) CreateEvent(ctx context.Context, req *CreateEventRequest) (*Ev
 	return &ev, nil
 }
 
+type UpdateEventRequest struct {
+	// Nil means "leave unchanged", so a partial update cannot silently blank a field.
+	Title       *string `json:"title"`
+	Description *string `json:"description"`
+	Category    *string `json:"category"`
+}
+
+// UpdateEvent edits an event's descriptive fields.
+//
+// The version bump happens in the same transaction as the change. That single fact is
+// what makes the read cache correct: the version is part of the cache key, so the
+// moment this commits, every previously cached representation becomes unreachable.
+// There is no purge to issue and no window in which a stale body can be served (D4).
+//
+//encore:api auth method=PATCH path=/v1/events/:eventID
+func (s *Service) UpdateEvent(ctx context.Context, eventID int64, req *UpdateEventRequest) (*Event, error) {
+	organizerID, err := callerID()
+	if err != nil {
+		return nil, err
+	}
+
+	if req.Title == nil && req.Description == nil && req.Category == nil {
+		return nil, badRequest("at least one field must be provided")
+	}
+	if req.Title != nil && trimmed(*req.Title) == "" {
+		return nil, badRequest("title must not be blank")
+	}
+	if req.Category != nil && trimmed(*req.Category) == "" {
+		return nil, badRequest("category must not be blank")
+	}
+
+	var title, description, category *string
+	if req.Title != nil {
+		t := trimmed(*req.Title)
+		title = &t
+	}
+	if req.Description != nil {
+		description = req.Description
+	}
+	if req.Category != nil {
+		c := trimmed(*req.Category)
+		category = &c
+	}
+
+	var ev Event
+	err = db.QueryRow(ctx, `
+		UPDATE events
+		   SET title       = coalesce($3, title),
+		       description = coalesce($4, description),
+		       category    = coalesce($5, category),
+		       version     = version + 1,
+		       updated_at  = $6
+		 WHERE event_id = $1 AND organizer_id = $2
+		RETURNING event_id, venue_id, title, description, category, status::text,
+		          version, starts_at, ends_at, onsale_at
+	`, eventID, organizerID, title, description, category, s.clock.Now()).
+		Scan(&ev.EventID, &ev.VenueID, &ev.Title, &ev.Description, &ev.Category,
+			&ev.Status, &ev.Version, &ev.StartsAt, &ev.EndsAt, &ev.OnsaleAt)
+	if errors.Is(err, sqldb.ErrNoRows) {
+		// NotFound rather than PermissionDenied: a non-owner should not learn that
+		// this event id exists.
+		return nil, &errs.Error{Code: errs.NotFound, Message: "event not found"}
+	} else if err != nil {
+		return nil, err
+	}
+	return &ev, nil
+}
+
 type PublishResponse struct {
 	EventID        int64  `json:"event_id"`
 	Status         string `json:"status"`

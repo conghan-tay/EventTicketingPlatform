@@ -95,8 +95,20 @@ func (c *Client) Get(path string, query url.Values) (*Response, error) {
 	return c.do(http.MethodGet, path, nil, nil)
 }
 
+// GetWithHeaders is used for conditional requests (If-None-Match).
+func (c *Client) GetWithHeaders(path string, query url.Values, headers map[string]string) (*Response, error) {
+	if len(query) > 0 {
+		path = path + "?" + query.Encode()
+	}
+	return c.do(http.MethodGet, path, nil, headers)
+}
+
 func (c *Client) Post(path string, body any) (*Response, error) {
 	return c.do(http.MethodPost, path, body, nil)
+}
+
+func (c *Client) Patch(path string, body any) (*Response, error) {
+	return c.do(http.MethodPatch, path, body, nil)
 }
 
 // PostWithHeaders is used for endpoints carrying an Idempotency-Key or hold token.

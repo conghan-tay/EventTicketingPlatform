@@ -76,6 +76,9 @@ type Event struct {
 	Tiers       []Tier    `json:"tiers"`
 	TotalSeats  int64     `json:"total_seats"`
 	Available   int64     `json:"available"`
+	// Stale marks the availability figures as advisory (D4).
+	Stale bool      `json:"stale"`
+	AsOf  time.Time `json:"as_of"`
 }
 
 type PublishResult struct {
@@ -205,6 +208,96 @@ func (h *Harness) GetEvent(eventID int64) Event {
 	var ev Event
 	require.NoError(h.t, resp.DecodeInto(&ev))
 	return ev
+}
+
+// CacheStats reports catalog cache counters, so a test can prove a read was served
+// from cache rather than assuming it.
+type CacheStats struct {
+	Hits     int64 `json:"hits"`
+	Misses   int64 `json:"misses"`
+	Errors   int64 `json:"errors"`
+	Rebuilds int64 `json:"rebuilds"`
+	Shed     int64 `json:"shed"`
+}
+
+func (h *Harness) CacheStats() CacheStats {
+	h.t.Helper()
+	resp, err := h.Get("/_test/cache-stats", nil)
+	require.NoError(h.t, err)
+	require.Equal(h.t, http.StatusOK, resp.Status, "cache stats: %s", resp.Body)
+
+	var out CacheStats
+	require.NoError(h.t, resp.DecodeInto(&out))
+	return out
+}
+
+// GetEventRaw fetches an event with optional conditional-request headers, so ETag and
+// 304 behaviour can be asserted.
+func (h *Harness) GetEventRaw(eventID int64, ifNoneMatch string) *Response {
+	h.t.Helper()
+	headers := map[string]string{}
+	if ifNoneMatch != "" {
+		headers["If-None-Match"] = ifNoneMatch
+	}
+	resp, err := h.Anonymous().GetWithHeaders(pathf("/v1/events/%d", eventID), nil, headers)
+	require.NoError(h.t, err)
+	return resp
+}
+
+// UpdateEventOpts is a partial event edit; nil fields are left unchanged.
+type UpdateEventOpts struct {
+	Title       *string
+	Description *string
+	Category    *string
+	User        string
+}
+
+// TryUpdateEvent edits an event and returns the raw response.
+func (h *Harness) TryUpdateEvent(eventID int64, opts UpdateEventOpts) *Response {
+	h.t.Helper()
+	if opts.User == "" {
+		opts.User = DefaultOrganizer
+	}
+
+	body := map[string]any{}
+	if opts.Title != nil {
+		body["title"] = *opts.Title
+	}
+	if opts.Description != nil {
+		body["description"] = *opts.Description
+	}
+	if opts.Category != nil {
+		body["category"] = *opts.Category
+	}
+
+	resp, err := h.AsUser(opts.User).Patch(pathf("/v1/events/%d", eventID), body)
+	require.NoError(h.t, err)
+	return resp
+}
+
+// UpdateEvent edits an event and requires success.
+func (h *Harness) UpdateEvent(eventID int64, opts UpdateEventOpts) Event {
+	h.t.Helper()
+	resp := h.TryUpdateEvent(eventID, opts)
+	require.Equal(h.t, http.StatusOK, resp.Status, "update event: %s", resp.Body)
+
+	var ev Event
+	require.NoError(h.t, resp.DecodeInto(&ev))
+	return ev
+}
+
+func StrPtr(s string) *string { return &s }
+
+// RefreshAvailability drops an event's cached availability snapshot.
+//
+// Encore cache TTLs are real Redis expiries, so the injected clock cannot age them
+// out. Dropping the key is how a test observes a sale without sleeping through the
+// 5s TTL — the TTL itself is deliberately not shortened for tests.
+func (h *Harness) RefreshAvailability(eventID int64) {
+	h.t.Helper()
+	resp, err := h.Post(pathf("/_test/refresh-availability/%d", eventID), nil)
+	require.NoError(h.t, err)
+	require.Equal(h.t, http.StatusOK, resp.Status, "refresh availability: %s", resp.Body)
 }
 
 // SeedPublishedEvent is the common setup: a venue, an on-sale event, and tickets.

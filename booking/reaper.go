@@ -74,6 +74,10 @@ func (s *Service) reap(ctx context.Context) (*ReapResult, error) {
 	}
 	out.HoldsExpired = res.RowsAffected()
 
+	if out.TicketsReleased > 0 {
+		mTicketsReaped.Add(uint64(out.TicketsReleased))
+	}
+
 	if out.TicketsReleased > 0 || out.HoldsExpired > 0 {
 		rlog.Info("reaped expired holds",
 			"tickets_released", out.TicketsReleased,

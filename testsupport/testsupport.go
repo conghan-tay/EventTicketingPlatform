@@ -13,6 +13,7 @@ import (
 	"encore.dev/beta/errs"
 
 	"encore.app/booking"
+	"encore.app/catalog"
 	"encore.app/internal/clock"
 	"encore.app/payments"
 	"encore.app/store"
@@ -52,7 +53,62 @@ func Reset(ctx context.Context) (*ResetResponse, error) {
 	if _, err := payments.ResetTestProvider(ctx); err != nil {
 		return nil, err
 	}
+	if _, err := catalog.ResetCacheStats(ctx); err != nil {
+		return nil, err
+	}
 	return &ResetResponse{Truncated: true}, nil
+}
+
+type CacheStatsResponse struct {
+	Hits     int64 `json:"hits"`
+	Misses   int64 `json:"misses"`
+	Errors   int64 `json:"errors"`
+	Rebuilds int64 `json:"rebuilds"`
+	Shed     int64 `json:"shed"`
+}
+
+// CacheStats exposes catalog cache counters, so a test can prove a repeat read was
+// actually served from cache rather than assuming it.
+//
+//encore:api public method=GET path=/_test/cache-stats
+func CacheStats(ctx context.Context) (*CacheStatsResponse, error) {
+	if err := requireControllableEnv(); err != nil {
+		return nil, err
+	}
+	s, err := catalog.GetCacheStats(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &CacheStatsResponse{
+		Hits: s.Hits, Misses: s.Misses, Errors: s.Errors,
+		Rebuilds: s.Rebuilds, Shed: s.Shed,
+	}, nil
+}
+
+// RefreshAvailability drops an event's cached availability snapshot.
+//
+// Encore cache TTLs are real Redis expiries, so the injected clock cannot age them
+// out. Rather than sleeping through the 5s TTL, tests drop the key explicitly.
+//
+//encore:api public method=POST path=/_test/refresh-availability/:eventID
+func RefreshAvailability(ctx context.Context, eventID int64) (*catalog.RefreshResponse, error) {
+	if err := requireControllableEnv(); err != nil {
+		return nil, err
+	}
+	return catalog.RefreshAvailability(ctx, eventID)
+}
+
+// Integrity audits an event's inventory from the authoritative tables.
+//
+// Public here only so the load proof can assert on it; the underlying booking
+// endpoint is private and the environment guard still applies.
+//
+//encore:api public method=GET path=/_test/integrity/:eventID
+func Integrity(ctx context.Context, eventID int64) (*booking.Integrity, error) {
+	if err := requireControllableEnv(); err != nil {
+		return nil, err
+	}
+	return booking.CheckIntegrity(ctx, eventID)
 }
 
 type ClockResponse struct {

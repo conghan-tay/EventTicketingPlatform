@@ -146,6 +146,10 @@ func (s *Service) createHold(ctx context.Context, userID string, eventID int64, 
 	if len(lost) > 0 {
 		// All-or-nothing: returning here rolls back, so the claimable seats in this
 		// request are left untouched for whoever asks next.
+		//
+		// A rising conflict rate is the signal that an onsale is genuinely contended,
+		// and is what would justify turning on the waiting room (D12).
+		mClaimConflicts.Increment()
 		return nil, seatUnavailable(lost)
 	}
 
@@ -197,6 +201,7 @@ func (s *Service) createHold(ctx context.Context, userID string, eventID int64, 
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+	mHoldsCreated.Increment()
 
 	return s.loadHold(ctx, holdID.String(), userID)
 }
@@ -278,6 +283,7 @@ func (s *Service) releaseHold(ctx context.Context, userID, holdID string) (*Rele
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+	mHoldsReleased.Increment()
 	return &ReleaseResponse{HoldID: holdID, TicketsReleased: res.RowsAffected()}, nil
 }
 

@@ -330,6 +330,8 @@ func (s *Service) convertToSold(
 		return nil, false, err
 	}
 
+	mHoldsConverted.Increment()
+
 	return &Booking{
 		BookingID:  bookingID.String(),
 		EventID:    l.EventID,
@@ -395,6 +397,8 @@ func (s *Service) recordDeclined(
 		return nil, err
 	}
 
+	mPaymentsFailed.Increment()
+
 	// The booking is a real, readable record of the failure, so the caller gets a
 	// business outcome rather than a bare error.
 	return nil, &errs.Error{
@@ -444,6 +448,7 @@ func (s *Service) compensate(
 		return nil, err
 	}
 
+	mCompensations.Increment()
 	rlog.Error("charged but could not deliver seats; refunding",
 		"booking_id", bookingID.String(), "payment_id", payment.PaymentID,
 		"hold_id", l.HoldID.String(), "amount_cents", l.TotalCents)

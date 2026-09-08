@@ -15,6 +15,6 @@ require (
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/crypto v0.42.0 // indirect
-	golang.org/x/sync v0.17.0 // indirect
+	golang.org/x/sync v0.23.0 // indirect
 	golang.org/x/text v0.29.0 // indirect
 )
