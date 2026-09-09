@@ -10,3 +10,4 @@ encore.gen.cue
 /bin/
 /tmp/
 /encore.gen
+.claude/
