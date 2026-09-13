@@ -14,6 +14,10 @@ Deviations from the plan as written, found during implementation:
 - **`createHold` rejects already-booked seats.** Redis knows nothing about bookings, so an acquire would
   happily lock a seat sold an hour earlier and the buyer would be compensated for a seat they never had a
   chance at.
+- **The lease Redis is self-managed, and cannot be otherwise.** Encore provisions Redis and its address is
+  discoverable from outside the process, but the Go binary runs with no `ENCORE_*` variables and
+  `encore.Meta()` exposes no infrastructure, so application code cannot find it. See D27 for the full
+  investigation. `scripts/dev.sh` and the two test scripts each start a `noeviction` container.
 - **The E2E lock-loss test asserts something stronger than planned.** Verification step 4 expected a
   compensation. In practice the layered checks refuse the losing buyer *before* the provider is called, so no
   money moves at all. The compensation path is unreachable from E2E and remains covered by the

@@ -78,9 +78,9 @@ func initService() (*Service, error) {
 	// Fail closed on a missing lease-store address.
 	//
 	// The address falls back to localhost so `encore run` and the test suite work
-	// without ceremony, but that fallback is actively dangerous anywhere else: a
-	// deployment with LOCK_REDIS_ADDR unset would start cleanly and then fail on the
-	// first booking. A configuration error should surface at boot, not at the till.
+	// without ceremony, but that fallback is dangerous anywhere else: a deployment with
+	// LOCK_REDIS_ADDR unset would start cleanly and then fail on the first booking. A
+	// configuration error should surface at boot, not at the till.
 	//
 	// This mirrors identity.ProductionLike, which refuses the development auth handler
 	// outside local and test for the same reason.

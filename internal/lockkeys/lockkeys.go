@@ -77,6 +77,13 @@ func Configured() bool { return os.Getenv("LOCK_REDIS_ADDR") != "" }
 // runs allkeys-lru and may evict anything under memory pressure, which is precisely
 // the wrong policy for a lock; this one should run noeviction.
 //
+// It is self-managed rather than Encore-provisioned, and that is not for want of
+// trying. Encore does provision Redis, and its address is even discoverable from
+// outside the process — but the Go application binary runs with a scrubbed
+// environment and no `ENCORE_*` variables at all, and `encore.Meta()` exposes no
+// infrastructure. There is no route from application code to an Encore-provisioned
+// cache's address, so a lock store that needs a raw client has to be our own.
+//
 // In a cloud deployment this is the seam where an Encore secret belongs.
 func Addr() string {
 	if addr := os.Getenv("LOCK_REDIS_ADDR"); addr != "" {

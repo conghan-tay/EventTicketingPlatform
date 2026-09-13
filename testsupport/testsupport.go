@@ -37,6 +37,36 @@ func locks() *redis.Client {
 	return lockClient
 }
 
+// deleteMatching removes every key under a glob, in batches.
+//
+// Scoped rather than FLUSHALL so a future co-tenant on this instance is not collateral
+// damage.
+func deleteMatching(ctx context.Context, pattern string) (int64, error) {
+	rdb := locks()
+
+	var (
+		cursor  uint64
+		deleted int64
+	)
+	for {
+		batch, next, err := rdb.Scan(ctx, cursor, pattern, 500).Result()
+		if err != nil {
+			return deleted, err
+		}
+		if len(batch) > 0 {
+			n, err := rdb.Del(ctx, batch...).Result()
+			if err != nil {
+				return deleted, err
+			}
+			deleted += n
+		}
+		if next == 0 {
+			return deleted, nil
+		}
+		cursor = next
+	}
+}
+
 // requireControllableEnv rejects the request unless this environment permits test
 // control. See clock.IsTimeControllableEnv for how a local environment is detected.
 func requireControllableEnv() error {
@@ -99,15 +129,7 @@ func EvictSeatLocks(ctx context.Context) (*EvictResponse, error) {
 		return nil, err
 	}
 
-	keys, err := locks().Keys(ctx, "lock:*").Result()
-	if err != nil {
-		return nil, err
-	}
-	if len(keys) == 0 {
-		return &EvictResponse{}, nil
-	}
-
-	deleted, err := locks().Del(ctx, keys...).Result()
+	deleted, err := deleteMatching(ctx, "lock:*")
 	if err != nil {
 		return nil, err
 	}

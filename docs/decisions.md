@@ -647,6 +647,23 @@ preserves every guarantee but does not deliver what was asked for.
 **Named trigger to revisit:** if lock loss is observed in production, or if `booking_compensations` becomes
 non-trivial — both would indicate the lease store's durability is costing real money.
 
+**Investigated and rejected — reusing Encore's provisioned Redis.** Encore *does* provision Redis, and its
+address *is* discoverable from outside the app: `ENCORE_RUNTIME_CONFIG_PATH` points at a JSON file listing
+`redis_servers` and `redis_databases`, and that local server answers `PING` and runs `EVAL`. Declaring
+`cache.NewCluster("seat-locks", {NoEviction})` does get a cluster provisioned, provided a keyspace is also
+declared on it — Encore prunes a cluster nothing references.
+
+It still does not work, for one decisive reason: **the Go application binary sees no `ENCORE_*` environment
+variables at all.** Verified by dumping `os.Environ()` from inside a running service — the result is empty.
+The variable belongs to the Encore supervisor process, not the app; the app is launched with a scrubbed
+environment and receives its config through the generated runtime bootstrap. `encore.Meta()` carries app id,
+environment, build and deploy metadata, and no infrastructure. There is no supported route from application
+code to an Encore-provisioned cache's address.
+
+So a lock store that needs a raw client has to be self-managed. The cost is the deployment gap: every
+environment must provision its own Redis and supply `LOCK_REDIS_ADDR`, and `booking.initService` fails closed
+when it is missing outside local and test.
+
 **Status:** accepted
 
 ---

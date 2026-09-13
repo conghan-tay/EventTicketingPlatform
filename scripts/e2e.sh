@@ -11,7 +11,8 @@ APP_PID=""
 
 # The seat lease lives in Redis, on its own instance rather than Encore's managed cache
 # cluster: that one runs allkeys-lru and may evict anything under pressure, which is the
-# wrong policy for a lock.
+# wrong policy for a lock. It is self-managed because Go application code has no way to
+# discover the address of an Encore-provisioned cache (see scripts/dev.sh).
 REDIS_CONTAINER="eventticketing-locks-$$"
 LOCK_REDIS_PORT="${LOCK_REDIS_PORT:-6399}"
 
@@ -21,8 +22,9 @@ docker run --rm -d --name "$REDIS_CONTAINER" -p "$LOCK_REDIS_PORT:6379" \
 
 export LOCK_REDIS_ADDR="127.0.0.1:$LOCK_REDIS_PORT"
 
-# Lease expiry is Redis TTL now — real wall time that no injected clock can advance —
-# so the suite has to outlive a lease to test expiry. HoldTTLForTests must match.
+
+# Lease expiry is Redis TTL — real wall time that no injected clock can advance — so
+# the suite has to outlive a lease to test expiry. HoldTTLForTests must match.
 export HOLD_TTL=2s
 
 cleanup() {

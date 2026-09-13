@@ -3,10 +3,13 @@
 #
 # `encore run` provisions Postgres and the catalog cache itself, but the lease store is
 # not an Encore resource — it needs Lua, which encore.dev/storage/cache does not expose
-# (D27). So nothing starts it, and a bare `encore run` gives you an app whose first hold
-# attempt fails on a refused connection. This script closes that gap.
+# (D27). Encore does provision Redis, and its address is even visible from outside the
+# process, but the Go binary runs with a scrubbed environment: no ENCORE_* variables at
+# all, and encore.Meta() carries no infrastructure. There is no route from application
+# code to an Encore-provisioned cache's address, so the lock store has to be our own.
 #
-# Use `make run`.
+# Without this, a bare `encore run` gives you an app whose first hold attempt fails on a
+# refused connection. Use `make run`.
 set -uo pipefail
 
 LOCK_REDIS_PORT="${LOCK_REDIS_PORT:-6399}"
