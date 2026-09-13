@@ -8,16 +8,64 @@ package testsupport
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"encore.dev/beta/errs"
+	"github.com/redis/go-redis/v9"
 
 	"encore.app/booking"
 	"encore.app/catalog"
 	"encore.app/internal/clock"
+	"encore.app/internal/lockkeys"
 	"encore.app/payments"
 	"encore.app/store"
 )
+
+// lockClient is the connection used to clear seat leases between tests.
+//
+// Lazily dialled, because testsupport is a package of plain functions rather than a
+// service struct, and a client created at init would connect in environments where
+// this service is inert.
+var (
+	lockOnce   sync.Once
+	lockClient *redis.Client
+)
+
+func locks() *redis.Client {
+	lockOnce.Do(func() { lockClient = lockkeys.NewClient() })
+	return lockClient
+}
+
+// deleteMatching removes every key under a glob, in batches.
+//
+// Scoped rather than FLUSHALL so a future co-tenant on this instance is not collateral
+// damage.
+func deleteMatching(ctx context.Context, pattern string) (int64, error) {
+	rdb := locks()
+
+	var (
+		cursor  uint64
+		deleted int64
+	)
+	for {
+		batch, next, err := rdb.Scan(ctx, cursor, pattern, 500).Result()
+		if err != nil {
+			return deleted, err
+		}
+		if len(batch) > 0 {
+			n, err := rdb.Del(ctx, batch...).Result()
+			if err != nil {
+				return deleted, err
+			}
+			deleted += n
+		}
+		if next == 0 {
+			return deleted, nil
+		}
+		cursor = next
+	}
+}
 
 // requireControllableEnv rejects the request unless this environment permits test
 // control. See clock.IsTimeControllableEnv for how a local environment is detected.
@@ -35,9 +83,63 @@ type ResetResponse struct {
 	Truncated bool `json:"truncated"`
 }
 
-// Reset empties every application table, returns the clock to real time, and restores
-// the mock payment provider. Called between E2E tests so each starts from a known
-// state — including the provider, or a scripted decline would leak into later tests.
+type FlushLocksResponse struct {
+	Flushed bool `json:"flushed"`
+}
+
+// FlushLocks drops every seat lease without touching the database.
+//
+// This exists to simulate the failure the Redis lease introduced and the database
+// design has to absorb: an eviction, a failover or a restart losing locks while
+// purchases are in flight. Two buyers can then believe they hold the same seat, and
+// the conditional write in convertToSold is the only thing standing between that and
+// an oversell.
+//
+// The old in-database lease had no equivalent failure, so it needed no such test. This
+// one is the direct evidence that moving the lease out did not move the invariant out
+// with it.
+//
+//encore:api public method=POST path=/_test/locks/flush
+func FlushLocks(ctx context.Context) (*FlushLocksResponse, error) {
+	if err := requireControllableEnv(); err != nil {
+		return nil, err
+	}
+	if err := locks().FlushAll(ctx).Err(); err != nil {
+		return nil, err
+	}
+	return &FlushLocksResponse{Flushed: true}, nil
+}
+
+type EvictResponse struct {
+	Evicted int64 `json:"evicted"`
+}
+
+// EvictSeatLocks drops the seat locks but leaves the lease records standing.
+//
+// This is the more dangerous half of a Redis failure and the one worth testing.
+// Flushing everything is survivable by accident: a buyer whose lease record vanished
+// is refused before any money moves. Losing only the lock — which is exactly what
+// allkeys-lru does when it picks keys to evict — leaves a buyer holding a lease that
+// looks valid, so they charge, and only the conditional write stops the seat being
+// sold to them as well as to whoever took it meanwhile.
+//
+//encore:api public method=POST path=/_test/locks/evict-seat-locks
+func EvictSeatLocks(ctx context.Context) (*EvictResponse, error) {
+	if err := requireControllableEnv(); err != nil {
+		return nil, err
+	}
+
+	deleted, err := deleteMatching(ctx, "lock:*")
+	if err != nil {
+		return nil, err
+	}
+	return &EvictResponse{Evicted: deleted}, nil
+}
+
+// Reset empties every application table, clears the seat leases, returns the clock to
+// real time, and restores the mock payment provider. Called between E2E tests so each
+// starts from a known state — including the provider, or a scripted decline would leak
+// into later tests.
 //
 //encore:api public method=POST path=/_test/reset
 func Reset(ctx context.Context) (*ResetResponse, error) {
@@ -45,6 +147,12 @@ func Reset(ctx context.Context) (*ResetResponse, error) {
 		return nil, err
 	}
 	if err := store.TruncateAll(ctx); err != nil {
+		return nil, err
+	}
+	// Leases outlive a table truncation — they are in Redis, keyed by ticket id, and
+	// ticket ids are a sequence that restarts. Without this, a lease from a previous
+	// test would lock a seat belonging to a brand new event.
+	if err := locks().FlushAll(ctx).Err(); err != nil {
 		return nil, err
 	}
 	if c, ok := clock.Testable(); ok {
@@ -238,30 +346,4 @@ func PaymentSummary(ctx context.Context) (*PaymentSummaryResponse, error) {
 		return nil, err
 	}
 	return &PaymentSummaryResponse{Charges: out.Charges, Refunds: out.Refunds}, nil
-}
-
-type ReapResponse struct {
-	TicketsReleased int64 `json:"tickets_released"`
-	HoldsExpired    int64 `json:"holds_expired"`
-}
-
-// ReapHolds runs the expiry reaper on demand.
-//
-// Encore cron jobs do not fire locally or in preview environments (D10), so this
-// guarded proxy is how tests drive expiry. It is also how an operator would force a
-// sweep.
-//
-//encore:api public method=POST path=/_test/reap-holds
-func ReapHolds(ctx context.Context) (*ReapResponse, error) {
-	if err := requireControllableEnv(); err != nil {
-		return nil, err
-	}
-	out, err := booking.ReapExpiredHolds(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return &ReapResponse{
-		TicketsReleased: out.TicketsReleased,
-		HoldsExpired:    out.HoldsExpired,
-	}, nil
 }

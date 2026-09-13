@@ -17,9 +17,12 @@ import (
 	"time"
 
 	"encore.dev/beta/errs"
+	"encore.dev/rlog"
 	"encore.dev/storage/sqldb"
+	"github.com/redis/go-redis/v9"
 
 	"encore.app/internal/clock"
+	"encore.app/internal/lockkeys"
 )
 
 var db = sqldb.Named("ticketing")
@@ -27,10 +30,35 @@ var db = sqldb.Named("ticketing")
 //encore:service
 type Service struct {
 	clock clock.Clock
+	// locks is a read-only view of the seat leases.
+	//
+	// Held seats no longer exist in Postgres — the ticket row is AVAILABLE or BOOKED —
+	// so the three-state seat map has to come from somewhere, and this is it. The
+	// catalog never writes a lock; it only overlays them onto rows it read from
+	// Postgres.
+	locks *redis.Client
 }
 
 func initService() (*Service, error) {
-	return &Service{clock: clock.Default()}, nil
+	return &Service{
+		clock: clock.Default(),
+		locks: lockkeys.NewClient(),
+	}, nil
+}
+
+// heldTickets reports which of an event's tickets are currently leased.
+//
+// Deliberately degrades rather than fails. This service must survive a lock-Redis
+// outage: availability here is advisory by design (D4), and answering "nothing is
+// held" is the same answer the client would get a few seconds later anyway. Failing
+// the read would take browsing down over a number nobody is allowed to rely on.
+func (s *Service) heldTickets(ctx context.Context, eventID int64) map[int64]bool {
+	held, err := lockkeys.LockedTickets(ctx, s.locks, eventID, s.clock.Now())
+	if err != nil {
+		rlog.Warn("lock lookup failed; reporting seats as unheld", "event_id", eventID, "err", err)
+		return nil
+	}
+	return held
 }
 
 type Venue struct {
@@ -329,10 +357,15 @@ func (s *Service) availability(ctx context.Context, eventID int64) (*Availabilit
 }
 
 func (s *Service) buildAvailability(ctx context.Context, eventID int64) (*AvailabilitySnapshot, error) {
+	// Held seats are not available to sell, but Postgres no longer knows which ones
+	// are held, so the lease set has to be subtracted per section. The ticket ids are
+	// selected alongside the counts for exactly that reason.
+	held := s.heldTickets(ctx, eventID)
+
 	rows, err := db.Query(ctx, `
 		SELECT pt.section,
 		       count(t.ticket_id),
-		       count(t.ticket_id) FILTER (WHERE t.status = 'AVAILABLE')
+		       coalesce(array_agg(t.ticket_id) FILTER (WHERE t.status = 'AVAILABLE'), '{}') AS available_ids
 		  FROM price_tiers pt
 		  LEFT JOIN tickets t
 		    ON t.event_id = pt.event_id AND t.price_tier_id = pt.price_tier_id
@@ -351,9 +384,17 @@ func (s *Service) buildAvailability(ctx context.Context, eventID int64) (*Availa
 		BuiltAt:  s.clock.Now(),
 	}
 	for rows.Next() {
-		var sec SectionAvailability
-		if err := rows.Scan(&sec.Section, &sec.Total, &sec.Available); err != nil {
+		var (
+			sec          SectionAvailability
+			availableIDs []int64
+		)
+		if err := rows.Scan(&sec.Section, &sec.Total, &availableIDs); err != nil {
 			return nil, err
+		}
+		for _, id := range availableIDs {
+			if !held[id] {
+				sec.Available++
+			}
 		}
 		out.Total += sec.Total
 		out.Available += sec.Available
@@ -409,6 +450,8 @@ func (s *Service) GetSeatMap(ctx context.Context, eventID int64, p *SeatMapParam
 		section = &p.Section
 	}
 
+	held := s.heldTickets(ctx, eventID)
+
 	rows, err := db.Query(ctx, `
 		SELECT t.ticket_id, s.section, s.row_label, s.seat_number,
 		       t.status::text, pt.price_cents
@@ -433,6 +476,11 @@ func (s *Service) GetSeatMap(ctx context.Context, eventID int64, p *SeatMapParam
 		if err := rows.Scan(&seat.TicketID, &seat.Section, &seat.RowLabel,
 			&seat.SeatNumber, &seat.Status, &seat.PriceCents); err != nil {
 			return nil, err
+		}
+		// Postgres wins for the terminal state. A BOOKED seat stays BOOKED even if a
+		// stale lock lingers, because a sale is durable and a lease is not.
+		if seat.Status == "AVAILABLE" && held[seat.TicketID] {
+			seat.Status = "HELD"
 		}
 		out.Seats = append(out.Seats, seat)
 	}

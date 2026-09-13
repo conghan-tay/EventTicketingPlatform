@@ -90,15 +90,15 @@ The system splits into two paths that must not share a cache, a connection pool,
 | **Seat** | A seat *template* in a venue (section, row, number) | — |
 | **Event** | A performance at a venue at a time, with an onsale window | `DRAFT → ON_SALE → CLOSED / CANCELLED` |
 | **PriceTier** | Price for a section within an event | — |
-| **Ticket** | **The contested resource** — one row per (event, seat); the sellable instance | `AVAILABLE → HELD → SOLD` |
-| **Hold** | A user's expiring lease over 1..N tickets, with an opaque token | `ACTIVE → CONVERTED / EXPIRED / RELEASED` |
+| **Ticket** | **The contested resource** — one row per (event, seat); the sellable instance | `AVAILABLE → BOOKED` |
+| **Hold** | A user's expiring lease over 1..N tickets, with an opaque token. **Lives in Redis, not Postgres** — see `additionalFeatures/RedisLock.md` | `ACTIVE → CONVERTED / EXPIRED / RELEASED` |
 | **Booking** | Durable result of a successful purchase | `PENDING → CONFIRMED / FAILED / COMPENSATING → COMPENSATED` |
 | **Payment** | Idempotent record of an external charge effect | `NOT_STARTED → IN_PROGRESS → COMPLETED / FAILED` |
 | **User** | Attendee identity | — |
 
 ### Ownership and invariants
 
-- `booking` service is authoritative for `tickets`, `holds`, `bookings`. **It is the only writer of inventory.**
+- `booking` service is authoritative for `tickets`, `bookings`, and the Redis seat leases. **It is the only writer of inventory.**
 - `organizer` service is authoritative for `venues`, `seats`, `events`, `price_tiers`.
 - `payments` service is authoritative for `payments`.
 - `catalog` and `search` own **no** authoritative state — they serve derived, cacheable projections.
@@ -154,11 +154,13 @@ POST /v1/venues                     POST /v1/venues/:venueID/seats
 POST /v1/events                     POST /v1/events/:eventID/publish   → materializes tickets
 ```
 
-### Internal — `private` (cron in cloud; invoked directly by tests locally)
+### Internal — `private`
+
+The hold reaper is gone: Redis expires leases itself.
 
 ```
-POST /internal/holds/reap            → releases expired holds, returns count
-POST /internal/bookings/reconcile    → resolves ambiguous IN_PROGRESS payments
+POST /internal/bookings/reconcile    → resolves ambiguous IN_PROGRESS payments (documented, NOT built)
+GET  /internal/booking/integrity/:id → recomputes the oversell audit from the tables
 ```
 
 ### Contracts
@@ -175,9 +177,9 @@ POST /internal/bookings/reconcile    → resolves ambiguous IN_PROGRESS payments
 ### Booking (the multi-step path)
 
 ```
-select seats → conditional claim (AVAILABLE→HELD, one short tx) → return hold + token
+select seats → atomic Redis lease (SET NX + ZADD, one Lua script) → return hold + token
 → user pays → charge with idempotency key (outside all locks)
-→ conditional convert (HELD→SOLD, fenced by hold token; same tx as booking insert + outbox row)
+→ conditional convert (AVAILABLE→BOOKED in Postgres; same tx as booking insert + outbox row)
 → CONFIRMED
 ```
 
@@ -188,7 +190,72 @@ Failure branches:
 | Payment declined | Release hold fenced by `hold_id` → booking `FAILED`. Clean. |
 | Charge succeeded but convert lost (hold expired mid-payment) | The money-losing case → `COMPENSATING` → refund → `COMPENSATED` + alert. **Mitigated preemptively:** only charge if remaining TTL > payment timeout budget; otherwise extend the hold (conditional on token) first. |
 | Crash between charge and convert | `reconcile` job finds `IN_PROGRESS` payments and resolves against the provider. **Never blind-retries a charge.** |
-| Hold abandoned | Reaper releases it, fenced by `hold_id` and `status='HELD'`. |
+| Hold abandoned | The Redis key expires on its own. There is no reaper. |
+| **Redis loses a lock** | New failure mode from the Redis lease. Two buyers can hold one seat; the conditional write sells it once and compensates the loser. Proven by `e2e/lockloss_test.go`. |
+
+#### Sequence — the happy path
+
+Hold, pay, confirm, with nothing going wrong. The branches in the table above are deliberately
+omitted so the shape of the successful path stays legible.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as Attendee
+    participant GW as Encore gateway
+    participant BK as booking
+    participant RD as Redis — leases
+    participant PG as Postgres — leader
+    participant PAY as payments
+    participant PR as Provider
+
+    rect rgb(255, 246, 233)
+    Note over U, PG: 1 — Claim. One atomic Lua script, all-or-nothing.
+    U->>GW: POST /v1/events/:id/holds {ticket_ids[]} + Idempotency-Key
+    GW->>BK: CreateHold, uid from the verified auth context only
+    BK->>PG: assert event ON_SALE, and every ticket exists and is not already BOOKED
+    BK->>RD: EVAL acquire — SET NX every lock, or none<br/>+ ZADD event and user indexes + SET hold record
+    Note right of RD: One Lua script, so the check-then-set across the<br/>whole seat set is indivisible. No lock ordering<br/>is needed: there is no deadlock to avoid.
+    RD-->>BK: OK
+    BK-->>U: 201 {hold_id, hold_token, expires_at, seats[], total_cents}
+    end
+
+    rect rgb(240, 240, 240)
+    Note over U, PR: 2 — Pay. The charge sits between two local commits — this is the saga.
+    U->>GW: POST /v1/holds/:id/purchase {payment_method}<br/>+ X-Hold-Token + Idempotency-Key
+    GW->>BK: Purchase
+    BK->>RD: GET hold record
+    BK->>BK: compare X-Hold-Token to the stored fence
+    Note right of BK: Checked before anything else, so a rejected<br/>purchase never reaches the provider.
+    BK->>RD: ZRANGEBYSCORE — which of these seats are still ours
+    BK->>PG: price those seats from price_tiers
+    Note over BK, PR: No transaction and no row lock is held across the charge.
+    BK->>PAY: Charge {idempotency_key, amount_cents}
+    PAY->>PG: INSERT payment IN_PROGRESS, unique on idempotency_key
+    PAY->>PR: charge
+    PR-->>PAY: approved + provider_ref
+    PAY->>PG: UPDATE payment COMPLETED
+    PAY-->>BK: Payment COMPLETED
+    end
+
+    rect rgb(238, 246, 252)
+    Note over U, PG: 3 — Confirm. Booking, seats and outbox commit together or not at all.
+    BK->>PG: BEGIN — INSERT booking CONFIRMED
+    BK->>PG: UPDATE tickets SET status = BOOKED, booking_id<br/>WHERE status = AVAILABLE
+    Note right of PG: The invariant lives here, in Postgres, not in Redis.<br/>Redis can lose a lock and hand one seat to two buyers —<br/>this predicate is what sells it exactly once.
+    BK->>PG: INSERT outbox booking.confirmed
+    BK->>PG: COMMIT
+    BK->>RD: EVAL release — drop the locks, mark the record CONVERTED
+    BK-->>U: 201 {booking_id, status CONFIRMED}
+    end
+```
+
+Two properties are worth reading off the diagram directly. First, **no external call is ever made inside a
+transaction** — the charge sits between two committed local steps, which is precisely why this is a saga and
+not a distributed transaction. Second, **the Redis lease is an optimistic gate, not the invariant**. Redis is
+not durable; it can drop a lock and let two buyers believe they hold one seat. What makes the oversell
+impossible is the `WHERE status = 'AVAILABLE'` predicate in the convert, backed by `UNIQUE (event_id,
+seat_id)`. The lease buys speed and free expiry; Postgres still decides who owns the seat.
 
 ### Search indexing
 
@@ -208,11 +275,85 @@ enforced at the service layer and each service can be scaled or extracted indepe
                     │                                               │
 client ──► Encore API gateway ──┬──► catalog  ─► cache ─► Postgres (replica-eligible)
                                 ├──► search   ─────────► Postgres (GIN / FTS)
-                                ├──► booking  ─────────► Postgres (LEADER ONLY, never cached)
+                                ├──► booking  ──┬──────► Postgres (LEADER ONLY, never cached)
+                                │               └──────► Redis (seat leases, noeviction)
                                 ├──► payments ─────────► provider (mock, Stripe-shaped)
                                 ├──► organizer ────────► Postgres
                                 └──► testsupport (local + test environments only)
 ```
+
+The same topology with the read/write split made explicit. Dashed edges are deferred, not built.
+
+```mermaid
+flowchart LR
+    Client(["client"])
+    CDN["CDN<br/>deferred"]
+    GW{{"Encore API gateway<br/>bearer auth · identity from context only"}}
+
+    subgraph readpath["Read path — eventually consistent, ≤5s stale, may serve stale"]
+        direction TB
+        CAT["catalog<br/>event detail · availability · seat map"]
+        REDIS[("Redis catalog-cache<br/>versioned keys · AllKeysLRU")]
+        LOCKS[("Redis seat leases<br/>SET NX + ZSET · noeviction")]
+        SRCH["search<br/>free text · date · radius · category"]
+        CAT <--> REDIS
+    end
+
+    subgraph writepath["Write path — strongly consistent, leader only, never cached"]
+        direction TB
+        ORG["organizer<br/>venues · seats · events · publish"]
+        BK["booking<br/>tickets · bookings · leases<br/>the only inventory writer"]
+        PAY["payments<br/>idempotent charge effects"]
+    end
+
+    %% Two Redis instances, deliberately. The cache may evict anything under pressure;
+    %% a lock must not, so the leases run noeviction on their own instance.
+
+    subgraph storage["Storage"]
+        direction TB
+        PG[("Postgres 18 — one ticketing DB<br/>tickets HASH PARTITION BY event_id<br/>GIN on events.search_vector")]
+        REPL[("read replicas<br/>deferred")]
+    end
+
+    PROV["payment provider<br/>mock · Stripe-shaped"]
+    TS["testsupport<br/>reset · seed · clock"]
+
+    Client --> GW
+    Client -.-> CDN
+    CDN -.-> GW
+
+    GW --> CAT
+    GW --> SRCH
+    GW --> BK
+    GW --> ORG
+    GW -. "local and test only" .-> TS
+
+    CAT -- "single-flight · 64 slots · shed" --> PG
+    CAT -. deferred .-> REPL
+    SRCH -- "GIN · keyset" --> PG
+    ORG -- "publish · version bump" --> PG
+    BK -- "leases · Lua acquire/release" --> LOCKS
+    CAT -. "read-only overlay<br/>ZRANGEBYSCORE" .-> LOCKS
+    BK -- "conditional write<br/>AVAILABLE→BOOKED · the invariant" --> PG
+    PAY --> PG
+    TS --> PG
+
+    BK -- "private · outside every tx" --> PAY
+    PAY --> PROV
+
+    classDef deferred stroke-dasharray:6 4,color:#666666,fill:#fafafa
+    class CDN,REPL deferred
+```
+
+The gateway is the only ingress, and it is where identity is established — no service ever reads a user id
+from a request body. `booking` is the only arrow into `tickets` and `bookings`, which is what makes the
+oversell invariant a property of one service rather than of the whole system.
+
+There are **two Redis instances, and the split is deliberate**. The catalog cache runs `allkeys-lru` and may
+evict anything under memory pressure, which is correct for a derived projection and catastrophic for a lock.
+The lease instance runs `noeviction`. `catalog`'s edge to it is dashed because it is read-only: the seat map
+overlays live leases onto Postgres rows so a held seat still renders as `HELD`, and it degrades to "nothing
+is held" rather than failing if that instance is unreachable.
 
 | Service | Responsibility | Why separate |
 |---|---|---|
@@ -265,8 +406,13 @@ and a money-losing failure mode.
 Decision-ladder position: **conditional write (level 2) + lease (level 6)**. A lease is required because
 exclusivity must span user think-time and an external payment call.
 
-Multi-seat holds are **all-or-nothing**, which requires a deterministic lock order to avoid deadlock when
-two users claim overlapping seat sets in opposite orders:
+**The lease moved to Redis** (`additionalFeatures/RedisLock.md`). That changed how a seat is claimed but not
+what guarantees the invariant. Redis is not durable — an eviction, a failover or a restart can drop a lock —
+so the lease is an optimistic gate, and the authoritative step is still the conditional write below. A lost
+lock costs a compensation; it can never cost a seat sold twice.
+
+Multi-seat holds are **all-or-nothing**. Under the old in-database lease this required a deterministic lock
+order to avoid deadlock between overlapping claims:
 
 ```sql
 BEGIN;
@@ -286,32 +432,30 @@ INSERT INTO holds (...) VALUES (...);
 COMMIT;
 ```
 
-**Why 1k claims/s on one event is fine:** concurrent claims touch **different rows**, so they do not
+Under the Redis lease this becomes one Lua script, which runs to completion without interleaving. There is
+no lock ordering to get right because there are never two lock-holders to form a cycle — the deadlock class
+is eliminated rather than avoided. What remains is the useful half of the old guarantee: contention resolves
+to one winner and clean conflicts, which `TestOverlappingMultiSeatClaimsResolveToOneWinner` pins down.
+
+**Why 1k claims/s on one event is fine:** concurrent claims touch **different keys**, so they do not
 conflict. Contention appears only on genuinely popular *seats*, where it resolves as a fast conditional
 failure. The real onsale risk is **connection exhaustion and retry storms**, addressed by PgBouncer,
 per-user rate limits, and (deferred) the waiting room.
 
-Locks are held for microseconds. **No external call ever occurs inside these transactions.**
+**No external call ever occurs inside the claim.**
 
-Purchase conversion is fenced by the hold token, so a stale holder can never sell a seat it lost:
-
-```sql
-UPDATE tickets SET status='SOLD', booking_id=$4, hold_id=NULL, hold_expires_at=NULL
- WHERE event_id=$1 AND ticket_id=ANY($2) AND status='HELD' AND hold_id=$3;
-```
-
-Expiry reaper — fenced, and safe to run concurrently:
+Purchase conversion is conditional on the ticket still being available, which is what makes the invariant a
+property of Postgres rather than of Redis:
 
 ```sql
-UPDATE tickets SET status='AVAILABLE', hold_id=NULL, hold_expires_at=NULL
- WHERE ticket_id IN (
-   SELECT ticket_id FROM tickets
-    WHERE status='HELD' AND hold_expires_at < $1
-    LIMIT 1000 FOR UPDATE SKIP LOCKED    -- multiple reapers never fight
- );
+UPDATE tickets SET status='BOOKED', booking_id=$1
+ WHERE event_id=$2 AND ticket_id=ANY($3) AND status='AVAILABLE';
+-- affected rows MUST equal len(ticket_ids), else ROLLBACK and compensate the charge
 ```
 
-`SKIP LOCKED` plus the `status='HELD'` predicate guarantees the reaper can never release a SOLD ticket.
+**Expiry needs no reaper.** The lock is a Redis key with a TTL; it expires on its own, and expiry never
+touches Postgres. A `BOOKED` ticket is therefore structurally unreachable by expiry — a strictly stronger
+guarantee than the old fenced reaper, which had to be written carefully to avoid releasing a sold seat.
 
 **Tradeoff:** all-or-nothing holds mean a user competing for a popular row loses the whole set and must
 retry. Accepted — partial holds are a worse experience and complicate pricing.
@@ -397,7 +541,6 @@ Metrics emitted (`encore.dev/metrics`), chosen so each one would change a decisi
 |---|---|
 | `booking_claim_conflicts` | How contended an onsale actually is — the trigger for the waiting room (D12) |
 | `booking_holds_created` / `_converted` / `_released` | Conversion funnel; a falling conversion rate means checkout is broken |
-| `booking_tickets_reaped` | How much inventory abandoned carts are tying up |
 | `booking_payments_failed` | Decline rate, distinct from provider errors |
 | `booking_compensations` | **Charged but undeliverable.** Any non-zero value is money owed back |
 | `catalog_cache_hits` / `_misses` / `_errors` | Hit rate, and cache-down distinguished from cache-cold |
@@ -418,4 +561,6 @@ proof asserts on it, and an operator can call it during an incident.
 | Temporal | When refunds, cancellations, transfers, or organizer payouts land |
 | Real-time seat updates (SSE) | Deferred with seat-map rendering |
 | Sharding `tickets` | When one partitioned Postgres no longer absorbs write volume |
+| **Lease-store durability** | The seat lease is in Redis and is not durable. Losing it cannot oversell, but it can strand a buyer mid-checkout. Revisit if lock loss is ever observed in production. |
+| **`bookings/reconcile` is unbuilt** | Documented in §4 and relied on by §5 and §7.3, but not implemented. An ambiguous `IN_PROGRESS` payment currently stays ambiguous forever. |
 | Multi-region | Beyond the initial single-region build |

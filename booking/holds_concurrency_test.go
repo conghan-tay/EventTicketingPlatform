@@ -8,10 +8,13 @@ import (
 	"time"
 
 	"encore.dev/beta/errs"
+	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"encore.app/internal/clock"
+	"encore.app/internal/lockkeys"
 	"encore.app/store"
 )
 
@@ -19,21 +22,52 @@ import (
 // user id: Encore offers no way to inject auth data into a unit test, and the
 // concurrency behaviour of the claim path is the single most important thing to prove.
 //
-// They run against a real Postgres provisioned by `encore test`, because the whole
-// point is the behaviour of row locks and conditional writes. A mock would test
-// nothing that matters here.
+// They run against a real Postgres provisioned by `encore test` and a real Redis
+// (miniredis, which implements EVAL), because the whole point is the behaviour of the
+// Lua acquire and the conditional write. A mock would test nothing that matters here.
 
-func newTestService() *Service {
-	return &Service{clock: clock.Real{}}
+// testEnv bundles the three things a booking test needs to control: the database, the
+// lease store, and time.
+type testEnv struct {
+	svc   *Service
+	mr    *miniredis.Miniredis
+	clock *clock.Controllable
+}
+
+// newTestEnv gives each test its own lease store and a frozen clock.
+func newTestEnv(t *testing.T) *testEnv {
+	t.Helper()
+
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	c := frozenClock()
+	return &testEnv{
+		svc:   &Service{clock: c, locks: NewRedisLocker(rdb)},
+		mr:    mr,
+		clock: c,
+	}
+}
+
+// advance moves both clocks forward together.
+//
+// Two clocks exist because two things measure time. Redis expires a lock against its
+// own clock, which miniredis.FastForward drives; the sorted-set score that answers
+// "which seats are held" is written from the injected application clock. In production
+// both are wall time and agree by construction. A test that moved only one would
+// produce a state that cannot occur in production — a lock key gone while its index
+// entry still looks live, or the reverse — so they are always advanced as a pair.
+func (e *testEnv) advance(d time.Duration) {
+	e.mr.FastForward(d)
+	e.clock.Advance(d)
 }
 
 // freshDB empties the database before a test.
 //
-// Encore reuses one test database across a package, and two things here are global by
-// nature: the reaper sweeps every expired hold regardless of event, and the per-user
-// hold quota counts a user's holds across all events. Without a clean slate, a test
-// would see leftovers from its predecessors — which is exactly how the first run of
-// these tests failed.
+// Encore reuses one test database across a package, and the per-user hold quota counts
+// a user's holds across all events, so a leftover from a previous test would change
+// this one's outcome.
 func freshDB(ctx context.Context, t *testing.T) {
 	t.Helper()
 	require.NoError(t, store.TruncateAll(ctx))
@@ -130,16 +164,25 @@ func seedEvent(ctx context.Context, t *testing.T, svc *Service, seatCount int) (
 	return eventID, ticketIDs
 }
 
-func ticketStatus(ctx context.Context, t *testing.T, ticketID int64) (string, *string) {
+// ticketStatus reads the durable state. Postgres knows only AVAILABLE or BOOKED now —
+// a held seat is still AVAILABLE here, and the lease lives in lockOwner.
+func ticketStatus(ctx context.Context, t *testing.T, ticketID int64) string {
 	t.Helper()
-	var (
-		status string
-		holdID *string
-	)
+	var status string
 	require.NoError(t, db.QueryRow(ctx, `
-		SELECT status::text, hold_id::text FROM tickets WHERE ticket_id = $1
-	`, ticketID).Scan(&status, &holdID))
-	return status, holdID
+		SELECT status::text FROM tickets WHERE ticket_id = $1
+	`, ticketID).Scan(&status))
+	return status
+}
+
+// lockOwner reports which user holds a seat, if anyone does.
+func (e *testEnv) lockOwner(t *testing.T, eventID, ticketID int64) (string, bool) {
+	t.Helper()
+	val, err := e.mr.Get(lockkeys.Lock(eventID, ticketID))
+	if err != nil {
+		return "", false
+	}
+	return val, true
 }
 
 // The central invariant: a seat has at most one owner. This is unreachable via an
@@ -147,8 +190,8 @@ func ticketStatus(ctx context.Context, t *testing.T, ticketID int64) (string, *s
 func TestConcurrentClaimsOnOneSeatYieldExactlyOneWinner(t *testing.T) {
 	ctx := context.Background()
 	freshDB(ctx, t)
-	svc := newTestService()
-	eventID, tickets := seedEvent(ctx, t, svc, 1)
+	env := newTestEnv(t)
+	eventID, tickets := seedEvent(ctx, t, env.svc, 1)
 	seat := tickets[0]
 
 	const racers = 32
@@ -168,7 +211,7 @@ func TestConcurrentClaimsOnOneSeatYieldExactlyOneWinner(t *testing.T) {
 			defer wg.Done()
 			<-start // release everyone at once to maximise real contention
 
-			hold, err := svc.createHold(ctx, fmt.Sprintf("racer-%d", i), eventID,
+			hold, err := env.svc.createHold(ctx, fmt.Sprintf("racer-%d", i), eventID,
 				&CreateHoldRequest{TicketIDs: []int64{seat}})
 
 			mu.Lock()
@@ -190,21 +233,26 @@ func TestConcurrentClaimsOnOneSeatYieldExactlyOneWinner(t *testing.T) {
 	require.Len(t, winners, 1, "exactly one claim may succeed")
 	assert.Equal(t, racers-1, aborted, "all other racers must lose cleanly")
 
-	// The database agrees with exactly one winner.
-	status, holdID := ticketStatus(ctx, t, seat)
-	assert.Equal(t, "HELD", status)
-	require.NotNil(t, holdID)
-	assert.Equal(t, winners[0], *holdID)
+	// Exactly one lock exists, and the seat is still AVAILABLE in Postgres: a hold is
+	// not a sale, and nothing durable has happened yet.
+	_, locked := env.lockOwner(t, eventID, seat)
+	assert.True(t, locked, "the winning claim must leave a lock behind")
+	assert.Equal(t, "AVAILABLE", ticketStatus(ctx, t, seat))
 }
 
-// Overlapping multi-seat claims submitted in opposing orders are the classic deadlock
-// shape. The ORDER BY in the locking read is what prevents it; without that, this test
-// fails with "deadlock detected" rather than clean conflicts.
-func TestOverlappingMultiSeatClaimsDoNotDeadlock(t *testing.T) {
+// Overlapping multi-seat claims submitted in opposing orders used to be the classic
+// deadlock shape, prevented by ORDER BY in the locking read.
+//
+// Under the Lua acquire there is no deadlock to avoid — a script runs to completion
+// without interleaving, so there are no two lock-holders to cycle. What still has to
+// hold is the useful half of the old guarantee: contention resolves to exactly one
+// winner and clean conflicts for everyone else, rather than a livelock in which
+// several claimants each grab part of the set and all back out.
+func TestOverlappingMultiSeatClaimsResolveToOneWinner(t *testing.T) {
 	ctx := context.Background()
 	freshDB(ctx, t)
-	svc := newTestService()
-	eventID, tickets := seedEvent(ctx, t, svc, 6)
+	env := newTestEnv(t)
+	eventID, tickets := seedEvent(ctx, t, env.svc, 6)
 
 	// Two overlapping sets, deliberately requested in opposite orders.
 	ascending := []int64{tickets[0], tickets[1], tickets[2], tickets[3]}
@@ -212,11 +260,11 @@ func TestOverlappingMultiSeatClaimsDoNotDeadlock(t *testing.T) {
 
 	const rounds = 24
 	var (
-		wg        sync.WaitGroup
-		mu        sync.Mutex
-		succeeded int
-		conflicts int
-		deadlocks []error
+		wg         sync.WaitGroup
+		mu         sync.Mutex
+		succeeded  int
+		conflicts  int
+		unexpected []error
 	)
 
 	start := make(chan struct{})
@@ -230,7 +278,7 @@ func TestOverlappingMultiSeatClaimsDoNotDeadlock(t *testing.T) {
 			defer wg.Done()
 			<-start
 
-			_, err := svc.createHold(ctx, fmt.Sprintf("user-%d", i), eventID,
+			_, err := env.svc.createHold(ctx, fmt.Sprintf("user-%d", i), eventID,
 				&CreateHoldRequest{TicketIDs: set})
 
 			mu.Lock()
@@ -241,17 +289,28 @@ func TestOverlappingMultiSeatClaimsDoNotDeadlock(t *testing.T) {
 			case errs.Code(err) == errs.Aborted, errs.Code(err) == errs.ResourceExhausted:
 				conflicts++
 			default:
-				deadlocks = append(deadlocks, err)
+				unexpected = append(unexpected, err)
 			}
 		}(i, set)
 	}
 	close(start)
 	wg.Wait()
 
-	assert.Empty(t, deadlocks,
-		"a deterministic lock order must turn contention into clean conflicts, never a deadlock")
+	assert.Empty(t, unexpected,
+		"contention must resolve as clean conflicts, never as an unexpected error")
 	assert.Equal(t, 1, succeeded, "the four contested seats can only be claimed once")
 	assert.Equal(t, rounds-1, conflicts)
+
+	// No seat may be left locked by a claim that reported failure — that is the
+	// partial-acquisition failure the all-or-nothing script exists to prevent.
+	locked := 0
+	for _, id := range ascending {
+		if _, ok := env.lockOwner(t, eventID, id); ok {
+			locked++
+		}
+	}
+	assert.Equal(t, len(ascending), locked,
+		"the single winner must hold all four seats, with no partial residue")
 }
 
 // All-or-nothing. A partial claim would strand the free seats: held by a hold the
@@ -259,17 +318,17 @@ func TestOverlappingMultiSeatClaimsDoNotDeadlock(t *testing.T) {
 func TestPartialAvailabilityRollsBackCompletely(t *testing.T) {
 	ctx := context.Background()
 	freshDB(ctx, t)
-	svc := newTestService()
-	eventID, tickets := seedEvent(ctx, t, svc, 5)
+	env := newTestEnv(t)
+	eventID, tickets := seedEvent(ctx, t, env.svc, 5)
 
 	// Take one seat out of circulation.
-	taken, err := svc.createHold(ctx, "first-buyer", eventID,
+	_, err := env.svc.createHold(ctx, "first-buyer", eventID,
 		&CreateHoldRequest{TicketIDs: []int64{tickets[2]}})
 	require.NoError(t, err)
 
 	// Now ask for a set that includes it.
 	requested := []int64{tickets[0], tickets[1], tickets[2], tickets[3]}
-	_, err = svc.createHold(ctx, "second-buyer", eventID,
+	_, err = env.svc.createHold(ctx, "second-buyer", eventID,
 		&CreateHoldRequest{TicketIDs: requested})
 
 	require.Error(t, err)
@@ -282,38 +341,36 @@ func TestPartialAvailabilityRollsBackCompletely(t *testing.T) {
 
 	// Critically: the other three seats are untouched and still claimable.
 	for _, id := range []int64{tickets[0], tickets[1], tickets[3]} {
-		status, holdID := ticketStatus(ctx, t, id)
-		assert.Equal(t, "AVAILABLE", status, "ticket %d must be rolled back", id)
-		assert.Nil(t, holdID, "ticket %d must carry no hold", id)
+		_, locked := env.lockOwner(t, eventID, id)
+		assert.False(t, locked, "ticket %d must carry no lock after a failed claim", id)
 	}
 
 	// And the first buyer still owns theirs.
-	status, holdID := ticketStatus(ctx, t, tickets[2])
-	assert.Equal(t, "HELD", status)
-	require.NotNil(t, holdID)
-	assert.Equal(t, taken.HoldID, *holdID)
+	owner, locked := env.lockOwner(t, eventID, tickets[2])
+	require.True(t, locked)
+	assert.Equal(t, "first-buyer", owner)
 
 	// A retry avoiding the contested seat now succeeds.
-	_, err = svc.createHold(ctx, "second-buyer", eventID,
+	_, err = env.svc.createHold(ctx, "second-buyer", eventID,
 		&CreateHoldRequest{TicketIDs: []int64{tickets[0], tickets[1], tickets[3]}})
 	assert.NoError(t, err)
 }
 
-// A whole event selling out under concurrency must sell every seat exactly once:
-// no oversell, and no seat stranded unclaimed.
+// A whole event selling out under concurrency must claim every seat exactly once:
+// no double claim, and no seat stranded unclaimed.
 func TestConcurrentSelloutClaimsEverySeatExactlyOnce(t *testing.T) {
 	ctx := context.Background()
 	freshDB(ctx, t)
-	svc := newTestService()
+	env := newTestEnv(t)
 
 	const seats = 40
-	eventID, tickets := seedEvent(ctx, t, svc, seats)
+	eventID, tickets := seedEvent(ctx, t, env.svc, seats)
 
 	var (
 		wg sync.WaitGroup
 		mu sync.Mutex
 		// Each seat maps to the set of holds that claimed it. Any entry with more
-		// than one hold is an oversell.
+		// than one hold is a double claim.
 		claimedBy = map[int64][]string{}
 	)
 
@@ -326,7 +383,7 @@ func TestConcurrentSelloutClaimsEverySeatExactlyOnce(t *testing.T) {
 			defer wg.Done()
 			<-start
 
-			hold, err := svc.createHold(ctx, fmt.Sprintf("buyer-%d", i), eventID,
+			hold, err := env.svc.createHold(ctx, fmt.Sprintf("buyer-%d", i), eventID,
 				&CreateHoldRequest{TicketIDs: []int64{seat}})
 			if err != nil {
 				return
@@ -340,37 +397,35 @@ func TestConcurrentSelloutClaimsEverySeatExactlyOnce(t *testing.T) {
 	wg.Wait()
 
 	for seat, holds := range claimedBy {
-		assert.Len(t, holds, 1, "seat %d was claimed by %d holds — that is an oversell", seat, len(holds))
+		assert.Len(t, holds, 1, "seat %d was claimed by %d holds — that is a double claim", seat, len(holds))
 	}
 	assert.Len(t, claimedBy, seats, "every seat should have been claimed exactly once")
 
-	// The database is the final word: exactly `seats` rows are HELD, none AVAILABLE.
-	var held, available int64
-	require.NoError(t, db.QueryRow(ctx, `
-		SELECT count(*) FILTER (WHERE status = 'HELD'),
-		       count(*) FILTER (WHERE status = 'AVAILABLE')
-		  FROM tickets WHERE event_id = $1
-	`, eventID).Scan(&held, &available))
-
-	assert.EqualValues(t, seats, held)
-	assert.EqualValues(t, 0, available, "a sold-out event must leave no seat stranded")
+	// Redis is the final word on the lease: every seat carries exactly one lock.
+	for _, id := range tickets {
+		_, locked := env.lockOwner(t, eventID, id)
+		assert.True(t, locked, "seat %d should be locked after a full sellout of holds", id)
+	}
 }
 
 // An expired lease must be claimable immediately, and only one racer may take it over.
 func TestConcurrentTakeoverOfExpiredHold(t *testing.T) {
 	ctx := context.Background()
 	freshDB(ctx, t)
-	testClock := frozenClock()
-	svc := &Service{clock: testClock}
+	env := newTestEnv(t)
 
-	eventID, tickets := seedEvent(ctx, t, svc, 1)
+	eventID, tickets := seedEvent(ctx, t, env.svc, 1)
 	seat := tickets[0]
 
-	_, err := svc.createHold(ctx, "abandoner", eventID, &CreateHoldRequest{TicketIDs: []int64{seat}})
+	_, err := env.svc.createHold(ctx, "abandoner", eventID, &CreateHoldRequest{TicketIDs: []int64{seat}})
 	require.NoError(t, err)
 
-	// Walk past the TTL without running the reaper.
-	testClock.Advance(HoldTTL + time.Minute)
+	// Walk past the TTL. There is no reaper to run: the lock key expires on its own,
+	// which is the whole point of moving the lease to Redis.
+	env.advance(HoldTTL() + time.Minute)
+
+	_, stillLocked := env.lockOwner(t, eventID, seat)
+	require.False(t, stillLocked, "the lock must expire on its own, with nothing sweeping it")
 
 	const racers = 16
 	var (
@@ -384,7 +439,7 @@ func TestConcurrentTakeoverOfExpiredHold(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			<-start
-			hold, err := svc.createHold(ctx, fmt.Sprintf("taker-%d", i), eventID,
+			hold, err := env.svc.createHold(ctx, fmt.Sprintf("taker-%d", i), eventID,
 				&CreateHoldRequest{TicketIDs: []int64{seat}})
 			if err == nil {
 				mu.Lock()
@@ -398,8 +453,42 @@ func TestConcurrentTakeoverOfExpiredHold(t *testing.T) {
 
 	require.Len(t, winners, 1, "an expired seat may be taken over by exactly one claimant")
 
-	status, holdID := ticketStatus(ctx, t, seat)
-	assert.Equal(t, "HELD", status)
-	require.NotNil(t, holdID)
-	assert.Equal(t, winners[0], *holdID)
+	_, locked := env.lockOwner(t, eventID, seat)
+	assert.True(t, locked, "the taking-over claim must leave a lock behind")
+	assert.Equal(t, "AVAILABLE", ticketStatus(ctx, t, seat))
+}
+
+// Quota is restored when a lease expires, so an abandoned checkout does not
+// permanently consume one of a user's three slots.
+//
+// This preserves the intent of the deleted TestReaperRestoresHoldQuota: the quota is
+// now a ZCOUNT over live sorted-set members rather than a count of ACTIVE hold rows,
+// and nothing sweeps it, so it has to fall away on its own.
+func TestExpiredHoldRestoresQuota(t *testing.T) {
+	ctx := context.Background()
+	freshDB(ctx, t)
+	env := newTestEnv(t)
+
+	eventID, tickets := seedEvent(ctx, t, env.svc, 8)
+
+	for i := range MaxActiveHoldsPerUser {
+		_, err := env.svc.createHold(ctx, "serial-abandoner", eventID,
+			&CreateHoldRequest{TicketIDs: []int64{tickets[i]}})
+		require.NoError(t, err)
+	}
+
+	_, err := env.svc.createHold(ctx, "serial-abandoner", eventID,
+		&CreateHoldRequest{TicketIDs: []int64{tickets[5]}})
+	require.Error(t, err)
+	assert.Equal(t, errs.ResourceExhausted, errs.Code(err), "the fourth hold must be refused")
+
+	env.advance(HoldTTL() + time.Minute)
+
+	active, err := env.svc.locks.ActiveHolds(ctx, "serial-abandoner", env.clock.Now())
+	require.NoError(t, err)
+	assert.EqualValues(t, 0, active, "expired leases must not count against the quota")
+
+	_, err = env.svc.createHold(ctx, "serial-abandoner", eventID,
+		&CreateHoldRequest{TicketIDs: []int64{tickets[5]}})
+	assert.NoError(t, err, "quota should be free once the leases have lapsed")
 }

@@ -1,8 +1,9 @@
 .PHONY: run test e2e loadproof fmt check clean
 
-# Boot the app with local Postgres + Redis provisioned by Encore.
+# Boot the app with local Postgres and the catalog cache (provisioned by Encore), plus
+# the seat-lease Redis (not an Encore resource, so the script starts it).
 run:
-	encore run
+	./scripts/dev.sh
 
 # Unit and service-level integration tests (Encore provisions isolated test databases).
 test:

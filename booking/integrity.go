@@ -8,12 +8,14 @@ import (
 
 // Observability counters. These are the numbers that tell you whether the contention
 // design is working, and the oversell gauge is the one that must never move.
+// booking_tickets_reaped is gone with the reaper: Redis expires locks itself, so
+// there is no sweep to count. The inventory tied up by abandoned carts is now visible
+// as the size of the per-event lock set rather than as a reap rate.
 var (
 	mClaimConflicts = metrics.NewCounter[uint64]("booking_claim_conflicts", metrics.CounterConfig{})
 	mHoldsCreated   = metrics.NewCounter[uint64]("booking_holds_created", metrics.CounterConfig{})
 	mHoldsConverted = metrics.NewCounter[uint64]("booking_holds_converted", metrics.CounterConfig{})
 	mHoldsReleased  = metrics.NewCounter[uint64]("booking_holds_released", metrics.CounterConfig{})
-	mTicketsReaped  = metrics.NewCounter[uint64]("booking_tickets_reaped", metrics.CounterConfig{})
 	mPaymentsFailed = metrics.NewCounter[uint64]("booking_payments_failed", metrics.CounterConfig{})
 	mCompensations  = metrics.NewCounter[uint64]("booking_compensations", metrics.CounterConfig{})
 )
@@ -29,18 +31,18 @@ type Integrity struct {
 	EventID   int64 `json:"event_id"`
 	Total     int64 `json:"total"`
 	Available int64 `json:"available"`
-	Held      int64 `json:"held"`
 	Sold      int64 `json:"sold"`
 
 	// DuplicateSeats counts seats represented by more than one ticket row for this
 	// event. Non-zero means the same physical seat could be sold twice.
+	//
+	// This is the direct oversell check, and it is deliberately unchanged by the move
+	// to Redis: it is computed from the authoritative tables and would catch a double
+	// sale no matter how the lease was lost.
 	DuplicateSeats int64 `json:"duplicate_seats"`
-	// SoldWithoutBooking counts sold tickets with no booking attached. Non-zero means
+	// SoldWithoutBooking counts booked tickets with no booking attached. Non-zero means
 	// somebody's seat has no record of who bought it.
 	SoldWithoutBooking int64 `json:"sold_without_booking"`
-	// HeldWithoutHold counts held tickets with no hold row, i.e. inventory locked by
-	// nobody, which nothing would ever release.
-	HeldWithoutHold int64 `json:"held_without_hold"`
 	// ConfirmedBookings and TicketsInConfirmedBookings must agree with Sold.
 	ConfirmedBookings          int64 `json:"confirmed_bookings"`
 	TicketsInConfirmedBookings int64 `json:"tickets_in_confirmed_bookings"`
@@ -61,14 +63,12 @@ func CheckIntegrity(ctx context.Context, eventID int64) (*Integrity, error) {
 	if err := db.QueryRow(ctx, `
 		SELECT count(*),
 		       count(*) FILTER (WHERE status = 'AVAILABLE'),
-		       count(*) FILTER (WHERE status = 'HELD'),
-		       count(*) FILTER (WHERE status = 'SOLD'),
-		       count(*) FILTER (WHERE status = 'SOLD' AND booking_id IS NULL),
-		       count(*) FILTER (WHERE status = 'HELD' AND hold_id IS NULL)
+		       count(*) FILTER (WHERE status = 'BOOKED'),
+		       count(*) FILTER (WHERE status = 'BOOKED' AND booking_id IS NULL)
 		  FROM tickets
 		 WHERE event_id = $1
-	`, eventID).Scan(&out.Total, &out.Available, &out.Held, &out.Sold,
-		&out.SoldWithoutBooking, &out.HeldWithoutHold); err != nil {
+	`, eventID).Scan(&out.Total, &out.Available, &out.Sold,
+		&out.SoldWithoutBooking); err != nil {
 		return nil, err
 	}
 
@@ -105,12 +105,13 @@ func CheckIntegrity(ctx context.Context, eventID int64) (*Integrity, error) {
 		return nil, err
 	}
 
+	// With HELD gone from the schema, every ticket is either available or booked, so
+	// the accounting identity tightens: there is no third bucket for a row to hide in.
 	out.Consistent = out.DuplicateSeats == 0 &&
 		out.SoldWithoutBooking == 0 &&
-		out.HeldWithoutHold == 0 &&
 		out.UnresolvedCompensations == 0 &&
 		out.Sold == out.TicketsInConfirmedBookings &&
-		out.Total == out.Available+out.Held+out.Sold
+		out.Total == out.Available+out.Sold
 
 	return out, nil
 }

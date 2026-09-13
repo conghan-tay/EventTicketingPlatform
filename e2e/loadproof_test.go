@@ -116,13 +116,8 @@ func TestLoadProofSellOutUnderConcurrency(t *testing.T) {
 	// finish the job sequentially so the run ends deterministically at a full sellout
 	// rather than "nearly".
 	t.Log("draining remaining inventory")
-	h.AdvanceClock(HoldTTLForTests + time.Minute)
-	h.ReapHolds()
+	waitForLeasesToLapse()
 	drainRemaining(t, h, eventID, &stats, &soldSeat)
-
-	// Final sweep so nothing is left HELD by an abandoned lease.
-	h.AdvanceClock(HoldTTLForTests + time.Minute)
-	h.ReapHolds()
 
 	final := h.Integrity(eventID)
 
@@ -148,15 +143,11 @@ func TestLoadProofSellOutUnderConcurrency(t *testing.T) {
 	assert.EqualValues(t, capacity, final.Sold,
 		"every seat must be sold: sold=%d of %d", final.Sold, capacity)
 	assert.EqualValues(t, 0, final.Available, "no seat may be left unsold")
-	assert.EqualValues(t, 0, final.Held,
-		"no seat may be stranded in HELD after the final reap")
 
 	assert.EqualValues(t, 0, final.DuplicateSeats,
 		"OVERSELL: a seat is represented by more than one ticket row")
 	assert.EqualValues(t, 0, final.SoldWithoutBooking,
 		"a sold seat with no booking means somebody's ticket has no owner record")
-	assert.EqualValues(t, 0, final.HeldWithoutHold,
-		"inventory held by nobody would never be released")
 	assert.EqualValues(t, 0, final.UnresolvedCompensations,
 		"money was taken without seats delivered and without a completed refund")
 
@@ -175,10 +166,6 @@ func TestLoadProofSellOutUnderConcurrency(t *testing.T) {
 	assert.Equal(t, capacity, distinct,
 		"the API reported %d distinct sold seats, expected %d", distinct, capacity)
 }
-
-// HoldTTLForTests mirrors booking.HoldTTL. Duplicated rather than imported because the
-// E2E suite deliberately speaks only HTTP and does not link the services.
-const HoldTTLForTests = 10 * time.Minute
 
 // nextBatch returns the next set of ticket ids to attempt.
 //
@@ -278,19 +265,23 @@ func drainRemaining(t *testing.T, h *Harness, eventID int64, stats *loadStats, s
 	t.Helper()
 
 	for round := range 400 {
-		state := h.Integrity(eventID)
-		if state.Available == 0 && state.Held == 0 {
+		// Integrity counts Postgres state, where a leased seat is still AVAILABLE.
+		// Zero available therefore means genuinely sold out.
+		if h.Integrity(eventID).Available == 0 {
 			return
 		}
-		if state.Held > 0 && state.Available == 0 {
-			// Only lapsed leases remain; expire them and try again.
-			h.AdvanceClock(HoldTTLForTests + time.Minute)
-			h.ReapHolds()
+
+		// The seat map is the view that knows about leases, so it is what says which
+		// seats can actually be claimed right now.
+		free := h.FreeTicketIDs(eventID)
+		if len(free) == 0 {
+			// Everything left is locked by an abandoned lease. Nothing sweeps it any
+			// more, so the only option is to outlive the TTL.
+			waitForLeasesToLapse()
 			continue
 		}
 
-		want := int(min(state.Available, int64(seatsPerPurchase)))
-		batch := h.AvailableTicketIDs(eventID, want)
+		batch := free[:min(len(free), seatsPerPurchase)]
 		attemptPurchase(t, h, eventID, "drainer-"+strconv.Itoa(round%20), batch, stats, soldSeat)
 	}
 	t.Fatal("could not drain remaining inventory within the round limit")
