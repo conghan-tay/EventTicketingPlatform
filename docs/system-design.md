@@ -190,6 +190,70 @@ Failure branches:
 | Crash between charge and convert | `reconcile` job finds `IN_PROGRESS` payments and resolves against the provider. **Never blind-retries a charge.** |
 | Hold abandoned | Reaper releases it, fenced by `hold_id` and `status='HELD'`. |
 
+#### Sequence — the happy path
+
+Hold, pay, confirm, with nothing going wrong. The branches in the table above are deliberately
+omitted so the shape of the successful path stays legible.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as Attendee
+    participant GW as Encore gateway
+    participant BK as booking
+    participant PG as Postgres — leader
+    participant PAY as payments
+    participant PR as Provider
+
+    rect rgb(255, 246, 233)
+    Note over U, PG: 1 — Claim. One short transaction, all-or-nothing.
+    U->>GW: POST /v1/events/:id/holds {ticket_ids[]} + Idempotency-Key
+    GW->>BK: CreateHold, uid from the verified auth context only
+    BK->>PG: BEGIN
+    BK->>PG: assert event ON_SALE and onsale_at reached, per injected clock
+    BK->>PG: SELECT ticket_id FROM tickets<br/>WHERE ticket_id = ANY($ids) ORDER BY ticket_id FOR UPDATE
+    Note right of PG: ORDER BY is load-bearing — it is the deadlock<br/>guard between concurrent overlapping claims.
+    BK->>PG: INSERT hold ACTIVE, hold_token, expires_at = now + 10 min
+    BK->>PG: UPDATE tickets SET status = HELD, hold_id, hold_expires_at
+    BK->>PG: COMMIT
+    BK-->>U: 201 {hold_id, hold_token, expires_at, seats[], total_cents}
+    end
+
+    rect rgb(240, 240, 240)
+    Note over U, PR: 2 — Pay. The charge sits between two local commits — this is the saga.
+    U->>GW: POST /v1/holds/:id/purchase {payment_method}<br/>+ X-Hold-Token + Idempotency-Key
+    GW->>BK: Purchase
+    BK->>PG: BEGIN — SELECT hold FOR UPDATE
+    BK->>BK: compare X-Hold-Token to the stored fence
+    Note right of BK: Checked before anything else, so a rejected<br/>purchase never reaches the provider.
+    BK->>PG: price from the tickets still carrying this hold_id
+    BK->>PG: COMMIT
+    Note over BK, PR: No transaction and no row lock is held across the charge.
+    BK->>PAY: Charge {idempotency_key, amount_cents}
+    PAY->>PG: INSERT payment IN_PROGRESS, unique on idempotency_key
+    PAY->>PR: charge
+    PR-->>PAY: approved + provider_ref
+    PAY->>PG: UPDATE payment COMPLETED
+    PAY-->>BK: Payment COMPLETED
+    end
+
+    rect rgb(238, 246, 252)
+    Note over U, PG: 3 — Confirm. Booking, seats and outbox commit together or not at all.
+    BK->>PG: BEGIN — INSERT booking CONFIRMED
+    BK->>PG: UPDATE tickets SET status = SOLD, booking_id<br/>WHERE status = HELD AND hold_id = $hold
+    Note right of PG: The fence. A stale holder can never sell<br/>a seat it has already lost.
+    BK->>PG: UPDATE holds SET status = CONVERTED
+    BK->>PG: INSERT outbox booking.confirmed
+    BK->>PG: COMMIT
+    BK-->>U: 201 {booking_id, status CONFIRMED}
+    end
+```
+
+Two properties are worth reading off the diagram directly. First, **no external call is ever made inside a
+transaction** — the charge sits between two committed local steps, which is precisely why this is a saga and
+not a distributed transaction. Second, **the seat is protected twice**: by the deterministic lock order when
+it is claimed, and by the `hold_id` fence when it is sold.
+
 ### Search indexing
 
 **No pipeline.** A `search_vector tsvector GENERATED ALWAYS AS (...) STORED` column with a GIN index keeps
@@ -213,6 +277,71 @@ client ──► Encore API gateway ──┬──► catalog  ─► cache ─
                                 ├──► organizer ────────► Postgres
                                 └──► testsupport (local + test environments only)
 ```
+
+The same topology with the read/write split made explicit. Dashed edges are deferred, not built.
+
+```mermaid
+flowchart LR
+    Client(["client"])
+    CDN["CDN<br/>deferred"]
+    GW{{"Encore API gateway<br/>bearer auth · identity from context only"}}
+    CRON["cron<br/>reap-expired-holds · 1 min"]
+
+    subgraph readpath["Read path — eventually consistent, ≤5s stale, may serve stale"]
+        direction TB
+        CAT["catalog<br/>event detail · availability · seat map"]
+        REDIS[("Redis catalog-cache<br/>versioned keys · AllKeysLRU")]
+        SRCH["search<br/>free text · date · radius · category"]
+        CAT <--> REDIS
+    end
+
+    subgraph writepath["Write path — strongly consistent, leader only, never cached"]
+        direction TB
+        ORG["organizer<br/>venues · seats · events · publish"]
+        BK["booking<br/>tickets · holds · bookings<br/>the only inventory writer"]
+        PAY["payments<br/>idempotent charge effects"]
+    end
+
+    subgraph storage["Storage"]
+        direction TB
+        PG[("Postgres 18 — one ticketing DB<br/>tickets HASH PARTITION BY event_id<br/>GIN on events.search_vector")]
+        REPL[("read replicas<br/>deferred")]
+    end
+
+    PROV["payment provider<br/>mock · Stripe-shaped"]
+    TS["testsupport<br/>reset · seed · clock"]
+
+    Client --> GW
+    Client -.-> CDN
+    CDN -.-> GW
+
+    GW --> CAT
+    GW --> SRCH
+    GW --> BK
+    GW --> ORG
+    GW -. "local and test only" .-> TS
+    CRON --> BK
+
+    CAT -- "single-flight · 64 slots · shed" --> PG
+    CAT -. deferred .-> REPL
+    SRCH -- "GIN · keyset" --> PG
+    ORG -- "publish · version bump" --> PG
+    BK -- "conditional writes<br/>FOR UPDATE · leader" --> PG
+    PAY --> PG
+    TS --> PG
+
+    BK -- "private · outside every tx" --> PAY
+    PAY --> PROV
+
+    classDef deferred stroke-dasharray:6 4,color:#666666,fill:#fafafa
+    class CDN,REPL deferred
+```
+
+The gateway is the only ingress, and it is where identity is established — no service ever reads a user id
+from a request body. `booking` is the only arrow into `tickets`, `holds` and `bookings`, which is what makes
+the oversell invariant a property of one service rather than of the whole system. Nothing on the read path
+has an edge into the write path: `catalog` cannot claim a seat, and `booking` never reads through Redis or a
+replica.
 
 | Service | Responsibility | Why separate |
 |---|---|---|
