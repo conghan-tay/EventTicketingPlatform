@@ -289,19 +289,18 @@ func TestReleaseHoldRequiresOwnership(t *testing.T) {
 	}())
 }
 
-// An expired hold must not block a new claim even before the reaper has run. Expiry
-// is a batch process, so the claim path has to treat a lapsed lease as claimable.
+// An expired lease must not block a new claim, and nothing has to run for that to be
+// true: the Redis key simply ceases to exist.
 func TestExpiredHoldIsImmediatelyReclaimable(t *testing.T) {
 	h := NewHarness(t)
-	h.SetClock(time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC))
 
 	eventID := h.SeedSellableEvent(t, 2, 2, 1000)
 	seats := h.AvailableTicketIDs(eventID, 2)
 
 	first := h.CreateHold(eventID, seats, HoldOpts{User: "abandoner"})
 
-	// Walk past the TTL without running the reaper.
-	h.AdvanceClock(31 * time.Minute)
+	// Outlive the TTL. AdvanceClock cannot reach a Redis TTL, so this genuinely waits.
+	waitForLeasesToLapse()
 
 	second := h.CreateHold(eventID, seats, HoldOpts{User: "buyer-b"})
 	assert.NotEqual(t, first.HoldID, second.HoldID)

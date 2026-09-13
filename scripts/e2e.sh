@@ -9,7 +9,26 @@ BASE_URL="${E2E_BASE_URL:-http://localhost:4000}"
 LOG_FILE="$(mktemp -t eventticketing-e2e-XXXXXX.log)"
 APP_PID=""
 
+# The seat lease lives in Redis, on its own instance rather than Encore's managed cache
+# cluster: that one runs allkeys-lru and may evict anything under pressure, which is the
+# wrong policy for a lock.
+REDIS_CONTAINER="eventticketing-locks-$$"
+LOCK_REDIS_PORT="${LOCK_REDIS_PORT:-6399}"
+
+echo "==> starting lock redis on :$LOCK_REDIS_PORT"
+docker run --rm -d --name "$REDIS_CONTAINER" -p "$LOCK_REDIS_PORT:6379" \
+  redis:8-alpine redis-server --maxmemory-policy noeviction >/dev/null
+
+export LOCK_REDIS_ADDR="127.0.0.1:$LOCK_REDIS_PORT"
+
+# Lease expiry is Redis TTL now — real wall time that no injected clock can advance —
+# so the suite has to outlive a lease to test expiry. HoldTTLForTests must match.
+export HOLD_TTL=2s
+
 cleanup() {
+  if [[ -n "${REDIS_CONTAINER:-}" ]]; then
+    docker rm -f "$REDIS_CONTAINER" >/dev/null 2>&1
+  fi
   if [[ -n "$APP_PID" ]] && kill -0 "$APP_PID" 2>/dev/null; then
     echo "==> stopping app (pid $APP_PID)"
     kill "$APP_PID" 2>/dev/null

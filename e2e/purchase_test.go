@@ -27,11 +27,11 @@ func TestPurchaseConfirmsBooking(t *testing.T) {
 	assert.Equal(t, hold.HoldID, booking.HoldID)
 	assert.EqualValues(t, 9000, booking.TotalCents, "2 seats at 4500")
 
-	// The seats are SOLD, and only those seats moved.
+	// The seats are BOOKED, and only those seats moved.
 	statuses := h.TicketStatuses(eventID)
 	for id, status := range statuses {
 		if contains(seats, id) {
-			assert.Equal(t, "SOLD", status, "ticket %d", id)
+			assert.Equal(t, "BOOKED", status, "ticket %d", id)
 		} else {
 			assert.Equal(t, "AVAILABLE", status, "ticket %d should be untouched", id)
 		}
@@ -61,7 +61,7 @@ func TestPurchaseConfirmsBooking(t *testing.T) {
 
 // A sold seat can never be claimed again. This is the invariant the whole design
 // exists to protect.
-func TestSoldSeatsCannotBeHeldAgain(t *testing.T) {
+func TestBookedSeatsCannotBeHeldAgain(t *testing.T) {
 	h := NewHarness(t)
 	eventID := h.SeedSellableEvent(t, 2, 2, 1000)
 	seats := h.AvailableTicketIDs(eventID, 2)
@@ -72,9 +72,9 @@ func TestSoldSeatsCannotBeHeldAgain(t *testing.T) {
 	resp := h.TryHold(eventID, seats, HoldOpts{User: "late-buyer"})
 	assert.Equal(t, http.StatusConflict, resp.Status, "body: %s", resp.Body)
 
-	// Still SOLD, and still owned by the original booking.
+	// Still BOOKED, and still owned by the original booking.
 	for _, id := range seats {
-		assert.Equal(t, "SOLD", h.TicketStatuses(eventID)[id])
+		assert.Equal(t, "BOOKED", h.TicketStatuses(eventID)[id])
 	}
 }
 
@@ -213,7 +213,7 @@ func TestPurchaseIdempotencyChargesOnce(t *testing.T) {
 	// Exactly two seats sold, not four.
 	sold := 0
 	for _, status := range h.TicketStatuses(eventID) {
-		if status == "SOLD" {
+		if status == "BOOKED" {
 			sold++
 		}
 	}
@@ -222,12 +222,11 @@ func TestPurchaseIdempotencyChargesOnce(t *testing.T) {
 
 func TestPurchaseRejectsExpiredHold(t *testing.T) {
 	h := NewHarness(t)
-	h.SetClock(time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC))
 
 	eventID := h.SeedSellableEvent(t, 2, 2, 1000)
 	hold := h.CreateHold(eventID, h.AvailableTicketIDs(eventID, 1), HoldOpts{})
 
-	h.AdvanceClock(31 * time.Minute)
+	waitForLeasesToLapse()
 
 	resp := h.TryPurchase(hold, PurchaseOpts{})
 	assert.Equal(t, http.StatusBadRequest, resp.Status, "body: %s", resp.Body)
@@ -239,19 +238,20 @@ func TestPurchaseRejectsExpiredHold(t *testing.T) {
 // charging, rather than racing the expiry and risking a charge with no seats.
 func TestPurchaseExtendsHoldWhenTTLIsShort(t *testing.T) {
 	h := NewHarness(t)
-	h.SetClock(time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC))
 
 	eventID := h.SeedSellableEvent(t, 2, 2, 1000)
 	seats := h.AvailableTicketIDs(eventID, 1)
 	hold := h.CreateHold(eventID, seats, HoldOpts{})
 
-	// Leave less than the payment budget on the clock (TTL 10m, budget 60s).
-	h.AdvanceClock(9*time.Minute + 30*time.Second)
+	// The test TTL is shorter than PaymentBudget, so every purchase in this suite is
+	// already inside the D9 danger window and must be extended before the charge.
+	// Waiting part-way in makes that explicit rather than incidental.
+	time.Sleep(HoldTTLForTests / 2)
 
 	booking := h.Purchase(hold, PurchaseOpts{})
 	assert.Equal(t, "CONFIRMED", booking.Status,
 		"a purchase inside the danger window should extend the lease and succeed, not fail")
-	assert.Equal(t, "SOLD", h.TicketStatuses(eventID)[seats[0]])
+	assert.Equal(t, "BOOKED", h.TicketStatuses(eventID)[seats[0]])
 }
 
 func TestListBookings(t *testing.T) {
@@ -318,7 +318,7 @@ func TestSellOutEventEndToEnd(t *testing.T) {
 	statuses := h.TicketStatuses(eventID)
 	require.Len(t, statuses, 12)
 	for id, status := range statuses {
-		assert.Equal(t, "SOLD", status, "ticket %d", id)
+		assert.Equal(t, "BOOKED", status, "ticket %d", id)
 	}
 
 	resp, err := h.Anonymous().Get(pathf("/v1/events/%d/availability", eventID), nil)

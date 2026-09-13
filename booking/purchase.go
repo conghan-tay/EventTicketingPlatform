@@ -139,81 +139,63 @@ type lease struct {
 	TicketIDs  []int64
 	TotalCents int64
 	ExpiresAt  time.Time
+	// rec is the underlying Redis lease, carried so the conversion and any
+	// compensation can address the same locks.
+	rec *HoldRecord
 }
 
-// prepareLease verifies ownership and the fence token, prices the seats from the
-// tickets actually still held, and applies the D9 TTL guarantee.
+// prepareLease verifies ownership and the fence token, prices the seats whose locks
+// this hold still owns, and applies the D9 TTL guarantee.
 func (s *Service) prepareLease(ctx context.Context, userID string, holdID uuid.UUID, token string) (*lease, error) {
 	now := s.clock.Now()
 
-	tx, err := db.Begin(ctx)
+	rec, err := s.locks.LoadHold(ctx, holdID.String())
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
-
-	var (
-		l         lease
-		status    string
-		storedTok string
-	)
-	err = tx.QueryRow(ctx, `
-		SELECT hold_id, event_id, hold_token, status::text, expires_at
-		  FROM holds
-		 WHERE hold_id = $1 AND user_id = $2
-		   FOR UPDATE
-	`, holdID, userID).Scan(&l.HoldID, &l.EventID, &storedTok, &status, &l.ExpiresAt)
-	if errors.Is(err, sqldb.ErrNoRows) {
+	// A lease whose TTL lapsed is simply gone from Redis; there is no tombstone to
+	// distinguish "expired" from "never existed".
+	if rec == nil {
+		return nil, &errs.Error{Code: errs.FailedPrecondition, Message: "hold has expired"}
+	}
+	if rec.UserID != userID {
 		return nil, notFound("hold not found")
-	} else if err != nil {
-		return nil, err
 	}
 
 	// Compare the fence before anything else. A caller with a stale token is not
 	// entitled to this lease even if the hold is otherwise fine.
-	if storedTok != token {
+	if rec.Token != token {
 		return nil, &errs.Error{Code: errs.PermissionDenied, Message: "invalid hold token"}
 	}
-	if status != "ACTIVE" {
+	if rec.Status != HoldActive {
 		return nil, &errs.Error{
 			Code:    errs.FailedPrecondition,
-			Message: "hold is no longer active (status " + status + ")",
+			Message: "hold is no longer active (status " + rec.Status + ")",
 		}
 	}
-	// Checked against the injected clock, not SQL now(), so expiry is testable.
-	if !l.ExpiresAt.After(now) {
+	if !rec.expiresAtTime().After(now) {
 		return nil, &errs.Error{Code: errs.FailedPrecondition, Message: "hold has expired"}
 	}
 
-	// Price from the tickets still carrying this hold. Reading through tickets.hold_id
-	// means a seat taken over by another claim cannot be charged for.
-	rows, err := tx.Query(ctx, `
-		SELECT t.ticket_id, pt.price_cents
-		  FROM tickets t
-		  JOIN price_tiers pt ON pt.price_tier_id = t.price_tier_id
-		 WHERE t.hold_id = $1 AND t.status = 'HELD'
-		 ORDER BY t.ticket_id
-	`, holdID)
+	// Which locks are genuinely still ours. This replaces the old read through
+	// tickets.hold_id and serves the same purpose: a seat taken over after a lapse
+	// must not be charged for.
+	locked, err := s.locks.LockedTickets(ctx, rec.EventID, now)
 	if err != nil {
 		return nil, err
 	}
-	for rows.Next() {
-		var (
-			ticketID int64
-			price    int64
-		)
-		if err := rows.Scan(&ticketID, &price); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		l.TicketIDs = append(l.TicketIDs, ticketID)
-		l.TotalCents += price
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
 
+	l := lease{
+		HoldID:    holdID,
+		EventID:   rec.EventID,
+		ExpiresAt: rec.expiresAtTime(),
+		rec:       rec,
+	}
+	for _, id := range rec.TicketIDs {
+		if locked[id] {
+			l.TicketIDs = append(l.TicketIDs, id)
+		}
+	}
 	if len(l.TicketIDs) == 0 {
 		return nil, &errs.Error{
 			Code:    errs.FailedPrecondition,
@@ -221,37 +203,70 @@ func (s *Service) prepareLease(ctx context.Context, userID string, holdID uuid.U
 		}
 	}
 
-	// D9: do not start a charge that could outlive the lease. Extending is safe here
-	// because the rows are ours and the update is fenced on hold_id.
+	// D9: do not start a charge that could outlive the lease.
+	//
+	// The extension is a compare-and-PEXPIRE: it only touches locks whose value is
+	// still this user, so a seat lost between the read and the extend is not silently
+	// re-acquired. Fewer extensions than seats means the set changed underneath us.
 	if l.ExpiresAt.Sub(now) < PaymentBudget {
 		newExpiry := now.Add(PaymentBudget)
 
-		res, err := tx.Exec(ctx, `
-			UPDATE tickets SET hold_expires_at = $2
-			 WHERE hold_id = $1 AND status = 'HELD'
-		`, holdID, newExpiry)
+		extendRec := *rec
+		extendRec.TicketIDs = l.TicketIDs
+
+		extended, err := s.locks.Extend(ctx, &extendRec, newExpiry, PaymentBudget)
 		if err != nil {
 			return nil, err
 		}
-		if res.RowsAffected() != int64(len(l.TicketIDs)) {
-			// Someone took a seat between the read and the extend.
+		if extended != int64(len(l.TicketIDs)) {
 			return nil, &errs.Error{
 				Code:    errs.Aborted,
 				Message: "hold changed while preparing payment; please retry",
 			}
 		}
-		if _, err := tx.Exec(ctx, `
-			UPDATE holds SET expires_at = $2 WHERE hold_id = $1 AND status = 'ACTIVE'
-		`, holdID, newExpiry); err != nil {
-			return nil, err
-		}
 		l.ExpiresAt = newExpiry
+		l.rec = &extendRec
 	}
 
-	if err := tx.Commit(); err != nil {
+	prices, err := s.ticketPrices(ctx, l.EventID, l.TicketIDs)
+	if err != nil {
 		return nil, err
 	}
+	if len(prices) != len(l.TicketIDs) {
+		return nil, &errs.Error{
+			Code:    errs.FailedPrecondition,
+			Message: "hold no longer covers any seats",
+		}
+	}
+	for _, cents := range prices {
+		l.TotalCents += cents
+	}
+
 	return &l, nil
+}
+
+// ticketPrices returns price_cents per ticket for a set of ids.
+func (s *Service) ticketPrices(ctx context.Context, eventID int64, ticketIDs []int64) (map[int64]int64, error) {
+	rows, err := db.Query(ctx, `
+		SELECT t.ticket_id, pt.price_cents
+		  FROM tickets t
+		  JOIN price_tiers pt ON pt.price_tier_id = t.price_tier_id
+		 WHERE t.event_id = $1 AND t.ticket_id = ANY($2)
+	`, eventID, ticketIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[int64]int64, len(ticketIDs))
+	for rows.Next() {
+		var id, cents int64
+		if err := rows.Scan(&id, &cents); err != nil {
+			return nil, err
+		}
+		out[id] = cents
+	}
+	return out, rows.Err()
 }
 
 // convertToSold performs the fenced conversion. The bool reports whether the seats
@@ -288,29 +303,29 @@ func (s *Service) convertToSold(
 		return nil, false, err
 	}
 
-	// The fence: only tickets still HELD by this exact hold convert. If another
-	// claimant took them over, hold_id no longer matches and this affects fewer rows.
+	// THE INVARIANT LIVES HERE.
+	//
+	// `status = 'AVAILABLE'` is what makes an oversell unrepresentable, and it is
+	// deliberately a property of Postgres rather than of the Redis lock. Redis can
+	// lose a lock to an eviction or a failover and hand the same seat to two buyers;
+	// both then arrive here, and the second one converts zero rows and is compensated.
+	// Without this predicate that second buyer would overwrite the first — the same
+	// seat, sold twice, with neither buyer refunded.
 	res, err := tx.Exec(ctx, `
 		UPDATE tickets
-		   SET status = 'SOLD', booking_id = $2, hold_id = NULL, hold_expires_at = NULL
-		 WHERE event_id = $3
-		   AND ticket_id = ANY($4)
-		   AND status = 'HELD'
-		   AND hold_id = $1
-	`, l.HoldID, bookingID, l.EventID, l.TicketIDs)
+		   SET status = 'BOOKED', booking_id = $1
+		 WHERE event_id = $2
+		   AND ticket_id = ANY($3)
+		   AND status = 'AVAILABLE'
+	`, bookingID, l.EventID, l.TicketIDs)
 	if err != nil {
 		return nil, false, err
 	}
 	if res.RowsAffected() != int64(len(l.TicketIDs)) {
 		// Roll back rather than sell a subset. The caller compensates the charge.
-		rlog.Warn("hold lost during payment; converting to compensation",
+		rlog.Warn("seats lost during payment; converting to compensation",
 			"hold_id", l.HoldID.String(), "expected", len(l.TicketIDs), "converted", res.RowsAffected())
 		return nil, false, nil
-	}
-
-	if _, err := tx.Exec(ctx,
-		`UPDATE holds SET status = 'CONVERTED' WHERE hold_id = $1`, l.HoldID); err != nil {
-		return nil, false, err
 	}
 
 	// Outbox row in the same transaction as the business state, so a crash cannot
@@ -328,6 +343,16 @@ func (s *Service) convertToSold(
 
 	if err := tx.Commit(); err != nil {
 		return nil, false, err
+	}
+
+	// The sale is durable now, so the locks have no further job. Dropping them early
+	// is cosmetic rather than load-bearing — they would expire on their own, and the
+	// seat map reads BOOKED from Postgres regardless — but leaving a sold seat looking
+	// held for the rest of the TTL is needless confusion.
+	l.rec.Status = HoldConverted
+	if _, err := s.locks.Release(ctx, l.rec); err != nil {
+		rlog.Warn("could not release locks after a confirmed sale; they will expire",
+			"hold_id", l.HoldID.String(), "err", err)
 	}
 
 	mHoldsConverted.Increment()
@@ -379,22 +404,24 @@ func (s *Service) recordDeclined(
 		return nil, err
 	}
 
-	// Fenced release: a seat already taken over by someone else is not ours to free,
-	// and a SOLD seat can never be released here.
-	if _, err := tx.Exec(ctx, `
-		UPDATE tickets
-		   SET status = 'AVAILABLE', hold_id = NULL, hold_expires_at = NULL
-		 WHERE hold_id = $1 AND status = 'HELD'
-	`, l.HoldID); err != nil {
-		return nil, err
-	}
-	if _, err := tx.Exec(ctx,
-		`UPDATE holds SET status = 'RELEASED' WHERE hold_id = $1`, l.HoldID); err != nil {
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 
-	if err := tx.Commit(); err != nil {
-		return nil, err
+	// A decline is a definite "no", so the seats go straight back on sale rather than
+	// waiting out the TTL. The release is a compare-and-delete: a seat already taken
+	// over by somebody else is not ours to free, and a BOOKED ticket holds no lock at
+	// all, so neither can be released here.
+	//
+	// This runs after the commit rather than inside it. Redis is not transactional
+	// with Postgres, and of the two orderings this is the safe one: a failure here
+	// leaves seats locked until the TTL lapses, whereas releasing first and then
+	// failing to record the booking would put seats back on sale while a charge may
+	// still be in play.
+	l.rec.Status = HoldReleased
+	if _, err := s.locks.Release(ctx, l.rec); err != nil {
+		rlog.Warn("could not release locks after a decline; they will expire",
+			"hold_id", l.HoldID.String(), "err", err)
 	}
 
 	mPaymentsFailed.Increment()

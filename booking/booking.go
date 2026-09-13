@@ -1,13 +1,20 @@
-// Package booking owns ticket inventory: tickets, holds and bookings.
+// Package booking owns ticket inventory: tickets and bookings, with the seat lease
+// held in Redis.
 //
 // It is the only writer of inventory in the system, and it never serves a read from
 // a cache or a replica. Correctness here rests on one invariant:
 //
-//	a ticket has at most one owner, and a SOLD ticket is never released.
+//	a ticket has at most one owner, and a BOOKED ticket is never released.
 //
 // That invariant is enforced by conditional writes on the individual ticket row,
 // backed by UNIQUE (event_id, seat_id) and CHECK constraints in the schema as the
 // final boundary. See docs/system-design.md §7.1.
+//
+// The lease itself lives in Redis (docs/additionalFeatures/RedisLock.md). That makes
+// acquisition fast and expiry free, but Redis is not durable: it can lose a lock to an
+// eviction or a failover. The lock is therefore an optimistic gate, and the
+// authoritative step remains the conditional UPDATE in convertToSold. A lost lock
+// costs a compensation, never a seat sold twice.
 //
 // Each exported API resolves the caller from the verified auth context and then
 // delegates to an unexported method taking the user id explicitly. That split is
@@ -16,21 +23,24 @@
 package booking
 
 import (
+	"os"
 	"time"
 
 	"encore.dev/beta/auth"
 	"encore.dev/beta/errs"
 	"encore.dev/storage/sqldb"
+	"encore.dev/storage/sqldb/sqlerr"
 
 	"encore.app/internal/clock"
+	"encore.app/internal/lockkeys"
 )
 
 var db = sqldb.Named("ticketing")
 
 const (
-	// HoldTTL is how long a claim survives without payment. Long enough for a real
-	// checkout, short enough that abandoned carts do not strand inventory.
-	HoldTTL = 10 * time.Minute
+	// defaultHoldTTL is how long a claim survives without payment. Long enough for a
+	// real checkout, short enough that abandoned carts do not strand inventory.
+	defaultHoldTTL = 10 * time.Minute
 
 	// MaxTicketsPerHold caps a single request. Real ticketing systems cap party size
 	// to blunt bulk buying.
@@ -41,13 +51,32 @@ const (
 	MaxActiveHoldsPerUser = 3
 )
 
+// HoldTTL is the lease duration, overridable via HOLD_TTL.
+//
+// It became configurable when expiry moved to Redis. The TTL is now real wall-clock
+// time that no injected clock can advance, so an end-to-end test of expiry has to
+// genuinely wait — and waiting ten minutes is not a test. Environments that exercise
+// expiry set this to a couple of seconds.
+func HoldTTL() time.Duration {
+	if raw := os.Getenv("HOLD_TTL"); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+			return d
+		}
+	}
+	return defaultHoldTTL
+}
+
 //encore:service
 type Service struct {
 	clock clock.Clock
+	locks Locker
 }
 
 func initService() (*Service, error) {
-	return &Service{clock: clock.Default()}, nil
+	return &Service{
+		clock: clock.Default(),
+		locks: NewRedisLocker(lockkeys.NewClient()),
+	}, nil
 }
 
 func callerID() (string, error) {
@@ -82,4 +111,13 @@ func seatUnavailable(lost []int64) error {
 		Message: "one or more requested seats are no longer available",
 		Details: SeatConflict{LostTicketIDs: lost},
 	}
+}
+
+// isUniqueViolation reports whether err is a unique-constraint violation, using
+// Encore's typed SQL error codes rather than matching on a raw SQLSTATE string.
+//
+// Still needed on the purchase path: bookings keep their idempotency index in
+// Postgres, since the bookings table is durable state and not a lease.
+func isUniqueViolation(err error) bool {
+	return sqldb.ErrCode(err) == sqlerr.UniqueViolation
 }

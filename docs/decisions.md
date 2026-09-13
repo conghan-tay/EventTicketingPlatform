@@ -608,3 +608,69 @@ invalidation surface the versioned cache was chosen specifically to avoid.
 p99 for `GET /v1/events/:id`.
 
 **Status:** accepted
+
+---
+
+## D27 — The seat lease moves from Postgres to Redis
+
+**Context / requirement:** A hold was a row in `holds` plus mutable state on the ticket row, swept by a cron
+reaper. The request was to replace it with a Redis lock: `SET ticket:{id} {user_id} NX EX ttl`, with TTL
+handling expiry and the ticket table reduced to `AVAILABLE | BOOKED`.
+
+**Chosen approach:** The lease lives in Redis, acquired by one Lua script that locks every requested seat or
+none. Expiry is the key's TTL, so there is no reaper. **Postgres keeps the conditional write** — the
+conversion is `UPDATE tickets SET status='BOOKED' ... WHERE status='AVAILABLE'` — so the oversell invariant
+did not move with the lease. A second Redis instance is used, running `noeviction`, separate from the
+catalog cache's `allkeys-lru`.
+
+**Why it fits:** Acquisition and release become single in-memory operations, and abandoned carts cost
+nothing to clean up. Keeping the conditional write means the durability gap in Redis is bounded: losing a
+lock can produce two buyers who believe they hold one seat, but only one of them can convert, so the cost is
+a compensation rather than a double sale.
+
+**Alternatives considered:** Trusting Redis as sole arbiter, with an unconditional Postgres write — simpler
+and faster, but it makes an oversell genuinely possible on any eviction or failover, which contradicts §2's
+hard invariant. Also considered keeping the Postgres claim and using Redis only as a pre-filter, which
+preserves every guarantee but does not deliver what was asked for.
+
+**Tradeoffs and consequences:**
+- The system now has two stores on the write path with no atomicity between them. Every ordering in
+  `purchase.go` is chosen so that a failure between them strands a lease rather than releasing a seat early.
+- Redis has no secondary indexes, so each access pattern needs its own key: five keys replace what two
+  Postgres tables and their indexes did. See `additionalFeatures/RedisLock.md`.
+- The seat map has to overlay Redis onto Postgres to keep its third state, since a held seat is now
+  `AVAILABLE` in the database.
+- **This was not a fix for a measured problem.** §7.1 argues Postgres row locking was already adequate here:
+  concurrent claims touch different rows and locks are held for microseconds. The change was made
+  deliberately, and the conditional write is what keeps it safe.
+
+**Named trigger to revisit:** if lock loss is observed in production, or if `booking_compensations` becomes
+non-trivial — both would indicate the lease store's durability is costing real money.
+
+**Status:** accepted
+
+---
+
+## D28 — D11 narrows: the injected clock no longer governs hold expiry
+
+**Context / requirement:** D11 established that business logic never calls `time.Now()` directly, so tests
+could advance time instead of sleeping. Redis TTL runs on real wall-clock and ignores any injected clock.
+
+**Chosen approach:** D11 still holds for event scheduling — `onsale_at`, `starts_at`, booking timestamps —
+and is withdrawn only for lease expiry. Unit tests use `miniredis.FastForward`, which drives Redis's own TTL
+clock, advanced in lockstep with the injected clock by `testEnv.advance`. E2E tests run the app with
+`HOLD_TTL=2s` and genuinely wait.
+
+**Why it fits:** The determinism D11 was protecting is preserved where it is cheap to preserve. Unit tests
+still never sleep. Only the E2E suite pays, and only about 20-30 seconds.
+
+**Alternatives considered:** Making the sorted-set score authoritative for expiry instead of the TTL, which
+would have kept expiry fully clock-injectable. Rejected in favour of the TTL being the single source of
+truth, at the cost of the test complexity above.
+
+**Tradeoffs and consequences:** Two clocks now have to be advanced together in unit tests, and a test that
+moved only one would construct a state that cannot occur in production. `testEnv.advance` exists so that
+cannot be done by accident. Nine reaper tests were deleted, six were rewritten for TTL expiry, and two were
+added to preserve invariants the reaper tests used to carry.
+
+**Status:** accepted

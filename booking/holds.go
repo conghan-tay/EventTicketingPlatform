@@ -8,7 +8,6 @@ import (
 
 	"encore.dev/beta/errs"
 	"encore.dev/storage/sqldb"
-	"encore.dev/storage/sqldb/sqlerr"
 	"github.com/google/uuid"
 )
 
@@ -52,158 +51,110 @@ func (s *Service) CreateHold(ctx context.Context, eventID int64, req *CreateHold
 	return s.createHold(ctx, userID, eventID, req)
 }
 
+// createHold acquires the Redis lease.
+//
+// There is no database transaction here at all. The claim is one atomic Lua script,
+// which is what replaces `SELECT ... ORDER BY ticket_id FOR UPDATE`: a script runs to
+// completion without interleaving, so the check-then-set across the whole seat set is
+// indivisible and there is no lock ordering to get right.
+//
+// Postgres is still consulted for whether the event is on sale, because that is
+// durable state Redis knows nothing about.
 func (s *Service) createHold(ctx context.Context, userID string, eventID int64, req *CreateHoldRequest) (*Hold, error) {
 	ticketIDs, err := validateTicketIDs(req.TicketIDs)
 	if err != nil {
 		return nil, err
 	}
 
-	// An idempotent replay must return the original hold without touching inventory.
-	if req.IdempotencyKey != "" {
-		existing, err := s.findHoldByIdempotencyKey(ctx, userID, req.IdempotencyKey)
-		if err != nil {
-			return nil, err
-		}
-		if existing != nil {
-			return existing, nil
-		}
-	}
-
 	now := s.clock.Now()
-	holdID := uuid.New()
-	token := uuid.NewString()
-	expiresAt := now.Add(HoldTTL)
-
-	tx, err := db.Begin(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	if err := s.assertOnSale(ctx, tx, eventID, now); err != nil {
+	if err := s.assertOnSale(ctx, eventID, now); err != nil {
 		return nil, err
 	}
 
-	if err := s.assertHoldQuota(ctx, tx, userID, now); err != nil {
+	// Every requested ticket must belong to this event and still be sellable. Redis
+	// holds no inventory, so without this check a caller could lock ticket ids that do
+	// not exist, belong to another event, or were sold long ago.
+	if err := s.assertTicketsClaimable(ctx, eventID, ticketIDs); err != nil {
 		return nil, err
 	}
 
-	// Lock the requested rows in a deterministic order.
+	// The idempotency key is claimed before any seat is touched.
 	//
-	// ORDER BY ticket_id is load-bearing. Two users claiming overlapping seat sets in
-	// opposite orders would otherwise deadlock; a consistent lock order turns that
-	// into one winner and one clean conflict.
-	//
-	// A ticket is claimable if it is AVAILABLE, or if it is HELD by a lease that has
-	// already lapsed. The latter matters because expiry is a batch process: a seat
-	// whose hold expired a second ago must be sellable immediately, not whenever the
-	// reaper next runs.
-	rows, err := tx.Query(ctx, `
-		SELECT ticket_id, status = 'AVAILABLE'
-		            OR (status = 'HELD' AND hold_expires_at <= $3) AS claimable,
-		       hold_id
-		  FROM tickets
-		 WHERE event_id = $1 AND ticket_id = ANY($2)
-		 ORDER BY ticket_id
-		   FOR UPDATE
-	`, eventID, ticketIDs, now)
-	if err != nil {
-		return nil, err
-	}
-
-	var (
-		found         []int64
-		lost          []int64
-		displacedHold []uuid.UUID
-	)
-	for rows.Next() {
-		var (
-			id        int64
-			claimable bool
-			holdRef   *uuid.UUID
-		)
-		if err := rows.Scan(&id, &claimable, &holdRef); err != nil {
-			rows.Close()
+	// In Postgres this ordering was free: the hold INSERT preceded the ticket UPDATE
+	// inside one transaction, so a concurrent replay lost on the unique index and
+	// claimed nothing. Redis has no cross-key transaction, so claiming the key first
+	// is what stops two identical requests from acquiring two different sets of seats.
+	var claimedIdem bool
+	if req.IdempotencyKey != "" {
+		existing, claimed, err := s.locks.ClaimIdempotency(ctx, userID, req.IdempotencyKey, HoldTTL())
+		if errors.Is(err, errIdemInFlight) {
+			return nil, &errs.Error{
+				Code:    errs.Unavailable,
+				Message: "a request with this idempotency key is in flight; retry shortly",
+			}
+		} else if err != nil {
 			return nil, err
 		}
-		found = append(found, id)
-		if !claimable {
-			lost = append(lost, id)
-		} else if holdRef != nil {
-			displacedHold = append(displacedHold, *holdRef)
+		if !claimed {
+			// Already resolved: return the original hold, inventory untouched.
+			return s.loadHold(ctx, existing, userID)
+		}
+		claimedIdem = true
+	}
+
+	// From here on, any failure must free the idempotency key, or a retry would be
+	// permanently answered with a failure that no longer applies.
+	releaseIdem := func() {
+		if claimedIdem {
+			_ = s.locks.ReleaseIdempotency(ctx, userID, req.IdempotencyKey)
 		}
 	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+
+	ttl := HoldTTL()
+	rec := &HoldRecord{
+		HoldID:    uuid.NewString(),
+		UserID:    userID,
+		EventID:   eventID,
+		TicketIDs: ticketIDs,
+		Token:     uuid.NewString(),
+		ExpiresAt: now.Add(ttl).UnixMilli(),
+		Status:    HoldActive,
+	}
+
+	result, err := s.locks.Acquire(ctx, rec, now, ttl, MaxActiveHoldsPerUser)
+	if err != nil {
+		releaseIdem()
 		return nil, err
 	}
 
-	// A ticket id that does not belong to this event is a client error, and is
-	// reported as not-found rather than as a conflict — nothing is contended.
-	if len(found) != len(ticketIDs) {
-		return nil, notFound("one or more ticket ids do not exist for this event")
-	}
-	if len(lost) > 0 {
-		// All-or-nothing: returning here rolls back, so the claimable seats in this
-		// request are left untouched for whoever asks next.
+	switch {
+	case result.QuotaExceeded:
+		releaseIdem()
+		return nil, &errs.Error{
+			Code:    errs.ResourceExhausted,
+			Message: "too many active holds; complete or release an existing hold first",
+		}
+	case len(result.Lost) > 0:
+		releaseIdem()
+		// All-or-nothing: nothing was claimed, so the seats in this request that were
+		// free remain free for whoever asks next.
 		//
 		// A rising conflict rate is the signal that an onsale is genuinely contended,
 		// and is what would justify turning on the waiting room (D12).
 		mClaimConflicts.Increment()
-		return nil, seatUnavailable(lost)
+		return nil, seatUnavailable(result.Lost)
 	}
 
-	// Taking over a lapsed lease invalidates it. Without this the previous holder's
-	// record would still read ACTIVE while owning no seats.
-	if len(displacedHold) > 0 {
-		if _, err := tx.Exec(ctx, `
-			UPDATE holds SET status = 'EXPIRED'
-			 WHERE hold_id = ANY($1) AND status = 'ACTIVE'
-		`, displacedHold); err != nil {
+	if claimedIdem {
+		if err := s.locks.CommitIdempotency(ctx, userID, req.IdempotencyKey, rec.HoldID, ttl); err != nil {
+			// The seats are held and the hold is real; only the replay shortcut is
+			// missing. Failing the request would be worse than a retry re-claiming.
 			return nil, err
 		}
 	}
 
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO holds (hold_id, event_id, user_id, hold_token, status,
-		                   expires_at, created_at, idempotency_key)
-		VALUES ($1, $2, $3, $4, 'ACTIVE', $5, $6, $7)
-	`, holdID, eventID, userID, token, expiresAt, now, nullIfEmpty(req.IdempotencyKey)); err != nil {
-		// Two concurrent replays of the same key: the unique index rejects the loser,
-		// which then reads back the winner's hold.
-		if isUniqueViolation(err) && req.IdempotencyKey != "" {
-			existing, findErr := s.findHoldByIdempotencyKey(ctx, userID, req.IdempotencyKey)
-			if findErr == nil && existing != nil {
-				return existing, nil
-			}
-		}
-		return nil, err
-	}
-
-	// The conditional write. The predicate repeats the claimable test so the update
-	// itself is guarded, not just the earlier read.
-	res, err := tx.Exec(ctx, `
-		UPDATE tickets
-		   SET status = 'HELD', hold_id = $3, hold_expires_at = $4, booking_id = NULL
-		 WHERE event_id = $1
-		   AND ticket_id = ANY($2)
-		   AND (status = 'AVAILABLE' OR (status = 'HELD' AND hold_expires_at <= $5))
-	`, eventID, ticketIDs, holdID, expiresAt, now)
-	if err != nil {
-		return nil, err
-	}
-	if res.RowsAffected() != int64(len(ticketIDs)) {
-		// Defensive: the rows are locked, so this should be unreachable. Rolling back
-		// is the only safe response — a partial claim would strand inventory.
-		return nil, seatUnavailable(ticketIDs)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
 	mHoldsCreated.Increment()
-
-	return s.loadHold(ctx, holdID.String(), userID)
+	return s.hydrate(ctx, rec, now)
 }
 
 // GetHold returns the caller's hold.
@@ -234,147 +185,150 @@ func (s *Service) ReleaseHold(ctx context.Context, holdID string) (*ReleaseRespo
 }
 
 func (s *Service) releaseHold(ctx context.Context, userID, holdID string) (*ReleaseResponse, error) {
-	id, err := uuid.Parse(holdID)
-	if err != nil {
-		return nil, notFound("hold not found")
-	}
-
-	tx, err := db.Begin(ctx)
+	rec, err := s.locks.LoadHold(ctx, holdID)
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
-
-	var status string
-	err = tx.QueryRow(ctx, `
-		SELECT status::text FROM holds
-		 WHERE hold_id = $1 AND user_id = $2
-		   FOR UPDATE
-	`, id, userID).Scan(&status)
-	if errors.Is(err, sqldb.ErrNoRows) {
+	if rec == nil || rec.UserID != userID {
+		// Not-found for both genuinely missing and not-owned, so a caller cannot probe
+		// for the existence of another user's hold.
 		return nil, notFound("hold not found")
-	} else if err != nil {
-		return nil, err
 	}
 
-	if status != "ACTIVE" {
+	if rec.Status != HoldActive {
 		return nil, &errs.Error{
 			Code:    errs.FailedPrecondition,
-			Message: "hold is not active (status " + status + ")",
+			Message: "hold is not active (status " + rec.Status + ")",
 		}
 	}
 
-	// Fenced on hold_id and status='HELD'. A SOLD ticket can never be released here,
-	// and a seat already taken over by another claim is not ours to give back.
-	res, err := tx.Exec(ctx, `
-		UPDATE tickets
-		   SET status = 'AVAILABLE', hold_id = NULL, hold_expires_at = NULL
-		 WHERE hold_id = $1 AND status = 'HELD'
-	`, id)
+	// Compare-and-delete inside the script: only locks this user still owns are freed.
+	// A seat already taken over by somebody else is not ours to give back, and a
+	// BOOKED ticket has no lock at all, so neither can be released here.
+	rec.Status = HoldReleased
+	released, err := s.locks.Release(ctx, rec)
 	if err != nil {
 		return nil, err
 	}
 
-	if _, err := tx.Exec(ctx,
-		`UPDATE holds SET status = 'RELEASED' WHERE hold_id = $1`, id); err != nil {
-		return nil, err
-	}
-
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
 	mHoldsReleased.Increment()
-	return &ReleaseResponse{HoldID: holdID, TicketsReleased: res.RowsAffected()}, nil
+	return &ReleaseResponse{HoldID: holdID, TicketsReleased: released}, nil
 }
 
-// loadHold reads a hold with its seats. Status is reported as EXPIRED once the lease
-// has lapsed, even if the stored row still says ACTIVE, because the reaper is a batch
-// process and a client must never see a lapsed lease described as active.
+// loadHold reads a hold and prices its seats.
 func (s *Service) loadHold(ctx context.Context, holdID, userID string) (*Hold, error) {
-	id, err := uuid.Parse(holdID)
+	rec, err := s.locks.LoadHold(ctx, holdID)
 	if err != nil {
+		return nil, err
+	}
+	if rec == nil || rec.UserID != userID {
 		return nil, notFound("hold not found")
 	}
+	return s.hydrate(ctx, rec, s.clock.Now())
+}
 
-	var (
-		h      Hold
-		status string
-	)
-	err = db.QueryRow(ctx, `
-		SELECT hold_id::text, event_id, hold_token, status::text, expires_at
-		  FROM holds
-		 WHERE hold_id = $1 AND user_id = $2
-	`, id, userID).Scan(&h.HoldID, &h.EventID, &h.HoldToken, &status, &h.ExpiresAt)
-	if errors.Is(err, sqldb.ErrNoRows) {
-		return nil, notFound("hold not found")
-	} else if err != nil {
+// hydrate turns a lease record into the API shape, joining Postgres for seat detail
+// and pricing.
+//
+// Seats are reported only while the lock is still live. A lapsed lease owns nothing,
+// so it reports an empty seat list and a zero total rather than describing seats that
+// are already back on sale.
+func (s *Service) hydrate(ctx context.Context, rec *HoldRecord, now time.Time) (*Hold, error) {
+	out := &Hold{
+		HoldID:    rec.HoldID,
+		EventID:   rec.EventID,
+		HoldToken: rec.Token,
+		ExpiresAt: rec.expiresAtTime(),
+		Status:    rec.Status,
+		Seats:     []HeldSeat{},
+	}
+
+	// A terminal lease owns nothing and has no time left to report.
+	if rec.Status != HoldActive {
+		return out, nil
+	}
+
+	// An ACTIVE record whose lease has lapsed is reported as EXPIRED. The record
+	// outlives its locks by design, so the stored status alone would lie here.
+	if remaining := out.ExpiresAt.Sub(now).Seconds(); remaining > 0 {
+		out.SecondsRemaining = remaining
+	} else {
+		out.Status = HoldExpired
+		return out, nil
+	}
+
+	// Which of this hold's tickets are still genuinely locked. A seat taken over by
+	// another claim after a lapse must not still appear here.
+	locked, err := s.locks.LockedTickets(ctx, rec.EventID, now)
+	if err != nil {
 		return nil, err
 	}
 
-	now := s.clock.Now()
-	if status == "ACTIVE" && !h.ExpiresAt.After(now) {
-		status = "EXPIRED"
+	live := make([]int64, 0, len(rec.TicketIDs))
+	for _, id := range rec.TicketIDs {
+		if locked[id] {
+			live = append(live, id)
+		}
 	}
-	h.Status = status
-	if remaining := h.ExpiresAt.Sub(now).Seconds(); remaining > 0 {
-		h.SecondsRemaining = remaining
+	if len(live) == 0 {
+		out.Status = HoldExpired
+		return out, nil
 	}
 
-	// Seats are read through tickets.hold_id, so a seat taken over by another claim
-	// correctly disappears from this hold.
+	seats, total, err := s.priceTickets(ctx, rec.EventID, live)
+	if err != nil {
+		return nil, err
+	}
+	out.Seats = seats
+	out.TotalCents = total
+	return out, nil
+}
+
+// priceTickets joins seat detail and tier price for a ticket set.
+func (s *Service) priceTickets(ctx context.Context, eventID int64, ticketIDs []int64) ([]HeldSeat, int64, error) {
 	rows, err := db.Query(ctx, `
 		SELECT t.ticket_id, s.section, s.row_label, s.seat_number, pt.price_cents
 		  FROM tickets t
 		  JOIN seats s        ON s.seat_id = t.seat_id
 		  JOIN price_tiers pt ON pt.price_tier_id = t.price_tier_id
-		 WHERE t.hold_id = $1
+		 WHERE t.event_id = $1 AND t.ticket_id = ANY($2)
 		 ORDER BY t.ticket_id
-	`, id)
+	`, eventID, ticketIDs)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer rows.Close()
 
-	h.Seats = []HeldSeat{}
+	var (
+		seats []HeldSeat
+		total int64
+	)
 	for rows.Next() {
 		var seat HeldSeat
 		if err := rows.Scan(&seat.TicketID, &seat.Section, &seat.RowLabel,
 			&seat.SeatNumber, &seat.PriceCents); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
-		h.TotalCents += seat.PriceCents
-		h.Seats = append(h.Seats, seat)
+		total += seat.PriceCents
+		seats = append(seats, seat)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return &h, nil
-}
-
-func (s *Service) findHoldByIdempotencyKey(ctx context.Context, userID, key string) (*Hold, error) {
-	var holdID string
-	err := db.QueryRow(ctx, `
-		SELECT hold_id::text FROM holds
-		 WHERE user_id = $1 AND idempotency_key = $2
-	`, userID, key).Scan(&holdID)
-	if errors.Is(err, sqldb.ErrNoRows) {
-		return nil, nil
-	} else if err != nil {
-		return nil, err
-	}
-	return s.loadHold(ctx, holdID, userID)
+	return seats, total, nil
 }
 
 // assertOnSale rejects a claim against an event that is not selling.
 //
 // The onsale window is compared against the injected clock, not SQL now(), or a test
-// could never exercise the pre-onsale path deterministically.
-func (s *Service) assertOnSale(ctx context.Context, tx *sqldb.Tx, eventID int64, now time.Time) error {
+// could never exercise the pre-onsale path deterministically. Note that D11 still
+// applies here: it is hold *expiry* that moved to real time, not event scheduling.
+func (s *Service) assertOnSale(ctx context.Context, eventID int64, now time.Time) error {
 	var (
 		status   string
 		onsaleAt time.Time
 	)
-	err := tx.QueryRow(ctx, `
+	err := db.QueryRow(ctx, `
 		SELECT status::text, onsale_at FROM events WHERE event_id = $1
 	`, eventID).Scan(&status, &onsaleAt)
 	if errors.Is(err, sqldb.ErrNoRows) {
@@ -398,21 +352,50 @@ func (s *Service) assertOnSale(ctx context.Context, tx *sqldb.Tx, eventID int64,
 	return nil
 }
 
-// assertHoldQuota enforces the per-user active-hold limit. Lapsed holds do not count,
-// so the quota throttles hoarding rather than punishing an abandoned checkout.
-func (s *Service) assertHoldQuota(ctx context.Context, tx *sqldb.Tx, userID string, now time.Time) error {
-	var active int64
-	if err := tx.QueryRow(ctx, `
-		SELECT count(*) FROM holds
-		 WHERE user_id = $1 AND status = 'ACTIVE' AND expires_at > $2
-	`, userID, now).Scan(&active); err != nil {
+// assertTicketsClaimable rejects ticket ids that are not part of this event, and those
+// already sold.
+//
+// The sold check matters more than it looks. Redis knows nothing about bookings, so an
+// acquire will happily lock a seat that was sold an hour ago; the conditional write
+// would then refuse the conversion and the buyer would be compensated for a seat they
+// never had a chance at. Catching it here turns that into an immediate, honest 409.
+//
+// A ticket id that does not belong to this event is a client error, and is reported as
+// not-found rather than as a conflict — nothing is contended.
+func (s *Service) assertTicketsClaimable(ctx context.Context, eventID int64, ticketIDs []int64) error {
+	rows, err := db.Query(ctx, `
+		SELECT ticket_id, status = 'BOOKED' FROM tickets
+		 WHERE event_id = $1 AND ticket_id = ANY($2)
+	`, eventID, ticketIDs)
+	if err != nil {
 		return err
 	}
-	if active >= MaxActiveHoldsPerUser {
-		return &errs.Error{
-			Code:    errs.ResourceExhausted,
-			Message: "too many active holds; complete or release an existing hold first",
+	defer rows.Close()
+
+	var found int64
+	var booked []int64
+	for rows.Next() {
+		var (
+			id       int64
+			isBooked bool
+		)
+		if err := rows.Scan(&id, &isBooked); err != nil {
+			return err
 		}
+		found++
+		if isBooked {
+			booked = append(booked, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	if found != int64(len(ticketIDs)) {
+		return notFound("one or more ticket ids do not exist for this event")
+	}
+	if len(booked) > 0 {
+		return seatUnavailable(booked)
 	}
 	return nil
 }
@@ -436,23 +419,11 @@ func validateTicketIDs(ids []int64) ([]int64, error) {
 		seen[id] = struct{}{}
 	}
 
-	// Sorting here means the lock order in SQL matches the caller's set regardless of
-	// the order they sent, which keeps the deadlock-avoidance property independent of
-	// client behaviour.
+	// Sorting keeps the lock order stable regardless of the order the client sent.
+	// Under the Lua acquire this is no longer load-bearing for deadlock avoidance —
+	// the script is indivisible — but a deterministic order keeps the conflict set
+	// reported back to the client stable across retries.
 	out := slices.Clone(ids)
 	slices.Sort(out)
 	return out, nil
-}
-
-func nullIfEmpty(s string) *string {
-	if s == "" {
-		return nil
-	}
-	return &s
-}
-
-// isUniqueViolation reports whether err is a unique-constraint violation, using
-// Encore's typed SQL error codes rather than matching on a raw SQLSTATE string.
-func isUniqueViolation(err error) bool {
-	return sqldb.ErrCode(err) == sqlerr.UniqueViolation
 }

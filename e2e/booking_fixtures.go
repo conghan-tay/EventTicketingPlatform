@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"net/http"
+	"slices"
 	"testing"
 	"time"
 
@@ -67,6 +68,25 @@ func (h *Harness) AvailableTicketIDs(eventID int64, n int) []int64 {
 		}
 	}
 	require.Len(h.t, out, n, "event %d does not have %d available seats", eventID, n)
+	return out
+}
+
+// FreeTicketIDs returns every claimable seat, without requiring a particular count.
+//
+// Distinct from AvailableTicketIDs, which insists on finding n seats and fails the
+// test otherwise. During a drain the caller needs to know how many are genuinely free
+// right now — a leased seat is still AVAILABLE in Postgres but is not claimable, and
+// only the seat map knows the difference.
+func (h *Harness) FreeTicketIDs(eventID int64) []int64 {
+	h.t.Helper()
+
+	var out []int64
+	for id, status := range h.TicketStatuses(eventID) {
+		if status == "AVAILABLE" {
+			out = append(out, id)
+		}
+	}
+	slices.Sort(out)
 	return out
 }
 
@@ -234,24 +254,6 @@ func (h *Harness) SetPaymentBehaviour(mode string) {
 	require.Equal(h.t, http.StatusOK, resp.Status, "set payment behaviour: %s", resp.Body)
 }
 
-type ReapResult struct {
-	TicketsReleased int64 `json:"tickets_released"`
-	HoldsExpired    int64 `json:"holds_expired"`
-}
-
-// ReapHolds runs the expiry reaper. Cron does not fire locally, so tests invoke it
-// directly through testsupport (D10).
-func (h *Harness) ReapHolds() ReapResult {
-	h.t.Helper()
-	resp, err := h.Post("/_test/reap-holds", nil)
-	require.NoError(h.t, err)
-	require.Equal(h.t, http.StatusOK, resp.Status, "reap: %s", resp.Body)
-
-	var out ReapResult
-	require.NoError(h.t, resp.DecodeInto(&out))
-	return out
-}
-
 // PaymentSummary reports provider call counts, so a test can prove a charge happened
 // exactly once across a retry.
 type PaymentSummary struct {
@@ -276,12 +278,10 @@ type IntegrityReport struct {
 	EventID   int64 `json:"event_id"`
 	Total     int64 `json:"total"`
 	Available int64 `json:"available"`
-	Held      int64 `json:"held"`
 	Sold      int64 `json:"sold"`
 
 	DuplicateSeats             int64 `json:"duplicate_seats"`
 	SoldWithoutBooking         int64 `json:"sold_without_booking"`
-	HeldWithoutHold            int64 `json:"held_without_hold"`
 	ConfirmedBookings          int64 `json:"confirmed_bookings"`
 	TicketsInConfirmedBookings int64 `json:"tickets_in_confirmed_bookings"`
 	UnresolvedCompensations    int64 `json:"unresolved_compensations"`
@@ -309,4 +309,22 @@ func (h *Harness) SeedSellableEvent(t *testing.T, rows, seatsPerRow int, priceCe
 		VenueOpts{Sections: []SectionSpec{{Name: "FLOOR", Rows: rows, SeatsPerRow: seatsPerRow}}},
 		EventOpts{Tiers: []TierSpec{{Section: "FLOOR", PriceCents: priceCents}}},
 	)
+}
+
+// HoldTTLForTests mirrors the HOLD_TTL the app under test runs with (see
+// scripts/e2e.sh). Duplicated rather than imported because the E2E suite deliberately
+// speaks only HTTP and does not link the services.
+//
+// It is seconds rather than minutes because lease expiry is now Redis TTL — real wall
+// time that no injected clock can advance. A test of expiry has to genuinely wait, so
+// the app under test is configured with a TTL short enough to wait for.
+const HoldTTLForTests = 2 * time.Second
+
+// waitForLeasesToLapse blocks until any outstanding lease has certainly expired.
+//
+// This is the cost of TTL-authoritative expiry: AdvanceClock cannot reach a Redis TTL,
+// so the only way past a lease is to outlive it. The margin absorbs scheduling jitter
+// on a loaded CI box.
+func waitForLeasesToLapse() {
+	time.Sleep(HoldTTLForTests + 750*time.Millisecond)
 }
