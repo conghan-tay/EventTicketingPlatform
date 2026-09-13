@@ -23,11 +23,13 @@
 package booking
 
 import (
+	"errors"
 	"os"
 	"time"
 
 	"encore.dev/beta/auth"
 	"encore.dev/beta/errs"
+	"encore.dev/rlog"
 	"encore.dev/storage/sqldb"
 	"encore.dev/storage/sqldb/sqlerr"
 
@@ -73,6 +75,23 @@ type Service struct {
 }
 
 func initService() (*Service, error) {
+	// Fail closed on a missing lease-store address.
+	//
+	// The address falls back to localhost so `encore run` and the test suite work
+	// without ceremony, but that fallback is actively dangerous anywhere else: a
+	// deployment with LOCK_REDIS_ADDR unset would start cleanly and then fail on the
+	// first booking. A configuration error should surface at boot, not at the till.
+	//
+	// This mirrors identity.ProductionLike, which refuses the development auth handler
+	// outside local and test for the same reason.
+	if !clock.IsTimeControllableEnv() && !lockkeys.Configured() {
+		return nil, errors.New(
+			"LOCK_REDIS_ADDR must be set outside local and test environments: " +
+				"the seat lease has no durable home without it")
+	}
+
+	rlog.Info("booking service using seat-lease store", "addr", lockkeys.Addr())
+
 	return &Service{
 		clock: clock.Default(),
 		locks: NewRedisLocker(lockkeys.NewClient()),

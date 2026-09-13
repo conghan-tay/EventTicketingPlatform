@@ -60,6 +60,17 @@ func Idem(userID, key string) string {
 	return "idem:hold:" + userID + ":" + hex.EncodeToString(sum[:16])
 }
 
+// DefaultAddr is the local-development fallback, matching scripts/dev.sh.
+const DefaultAddr = "127.0.0.1:6399"
+
+// Configured reports whether an address was supplied explicitly.
+//
+// Callers use this to fail closed outside local development. An unset address is a
+// configuration error, not a transient one: silently falling back to localhost means a
+// misconfigured deployment starts cleanly and then fails on the first booking, which is
+// the worst possible time to find out.
+func Configured() bool { return os.Getenv("LOCK_REDIS_ADDR") != "" }
+
 // Addr resolves the lock instance's address.
 //
 // This is deliberately a different Redis from Encore's managed cache cluster. That one
@@ -71,7 +82,7 @@ func Addr() string {
 	if addr := os.Getenv("LOCK_REDIS_ADDR"); addr != "" {
 		return addr
 	}
-	return "127.0.0.1:6379"
+	return DefaultAddr
 }
 
 // NewClient dials the lock instance.
